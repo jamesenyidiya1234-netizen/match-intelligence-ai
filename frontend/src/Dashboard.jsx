@@ -23,7 +23,6 @@ export default function Dashboard({ onNavigate, pageFilter = 'all' }) {
     return () => clearInterval(interval);
   }, []);
 
-  // Helper to get Monday of a given date
   function getMonday(d) {
     d = new Date(d);
     const day = d.getDay();
@@ -31,13 +30,11 @@ export default function Dashboard({ onNavigate, pageFilter = 'all' }) {
     return new Date(d.setDate(diff));
   }
 
-  // Helper to format date as "MONDAY — 12 OCTOBER 2026"
   function formatDate(date) {
     const options = { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' };
     return date.toLocaleDateString('en-US', options).toUpperCase();
   }
 
-  // Filter by Navigation
   let filteredPredictions = [...predictions];
 
   if (pageFilter === 'football') filteredPredictions = filteredPredictions.filter(p => p.sport === 'football');
@@ -45,7 +42,6 @@ export default function Dashboard({ onNavigate, pageFilter = 'all' }) {
   else if (pageFilter === 'motd') filteredPredictions = filteredPredictions.sort((a, b) => b.confidenceScore - a.confidenceScore).slice(0, 1);
   else if (pageFilter === 'value') filteredPredictions = filteredPredictions.filter(p => p.bestMarketString?.includes('Over') || p.bestMarketString?.includes('BTTS'));
 
-  // Filter by Search Query
   if (searchQuery.trim() !== '') {
     const q = searchQuery.toLowerCase();
     filteredPredictions = filteredPredictions.filter(p => {
@@ -56,7 +52,6 @@ export default function Dashboard({ onNavigate, pageFilter = 'all' }) {
     });
   }
 
-  // Filter by Week
   const weekEnd = new Date(currentWeekStart);
   weekEnd.setDate(currentWeekStart.getDate() + 7);
 
@@ -65,7 +60,6 @@ export default function Dashboard({ onNavigate, pageFilter = 'all' }) {
     return matchDate >= currentWeekStart && matchDate < weekEnd;
   });
 
-  // Group by Day (Mon-Sun)
   const daysOfWeek = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
   const groupedMatches = {};
 
@@ -77,11 +71,10 @@ export default function Dashboard({ onNavigate, pageFilter = 'all' }) {
     groupedMatches[dayName] = {
       date: formatDate(dayDate),
       matches: weekMatches.filter(p => new Date(p.date).toDateString() === dateString)
-                           .sort((a,b) => new Date(a.date) - new Date(b.date)) // Sort chronologically
+                           .sort((a,b) => new Date(a.date) - new Date(b.date))
     };
   });
 
-  // Week Navigation
   const changeWeek = (weeks) => {
     const newDate = new Date(currentWeekStart);
     newDate.setDate(newDate.getDate() + (weeks * 7));
@@ -111,7 +104,6 @@ export default function Dashboard({ onNavigate, pageFilter = 'all' }) {
           ⚠️ Responsible Betting Notice: Sports predictions are probabilities, not guarantees.
         </div>
 
-        {/* Search Bar */}
         <div className="mb-8 flex flex-col md:flex-row gap-4 items-center justify-between bg-gray-800 p-4 rounded-xl border border-gray-700">
           <div className="relative w-full md:w-2/3">
             <input type="text" placeholder="Search any team, match, or league..." value={searchQuery} onChange={(e) => setSearchQuery(e.target.value)} className="w-full bg-gray-900 text-white rounded-lg py-3 pl-10 pr-4 border border-gray-700 focus:border-emerald-500 outline-none transition" />
@@ -121,7 +113,6 @@ export default function Dashboard({ onNavigate, pageFilter = 'all' }) {
           <div className="text-sm text-gray-400">{weekMatches.length} {weekMatches.length === 1 ? 'match' : 'matches'} this week</div>
         </div>
 
-        {/* Week Navigation */}
         <div className="mb-8 flex items-center justify-between bg-gray-800 p-4 rounded-xl border border-gray-700">
           <button onClick={() => changeWeek(-1)} className="px-4 py-2 bg-gray-700 hover:bg-gray-600 rounded text-sm font-bold">← Previous Week</button>
           <div className="text-center">
@@ -133,10 +124,8 @@ export default function Dashboard({ onNavigate, pageFilter = 'all' }) {
         
         <button onClick={() => setCurrentWeekStart(getMonday(new Date()))} className="mb-8 mx-auto block text-xs text-blue-400 hover:text-blue-300 underline">Return to Current Week</button>
 
-        {/* Weekly Match Fixtures & AI Predictions */}
         <h2 className="text-2xl font-bold mb-6 text-white text-center border-b border-gray-800 pb-4">WEEKLY MATCH FIXTURES & AI PREDICTIONS</h2>
 
-        {/* Render 7 Days */}
         <div className="space-y-12">
           {daysOfWeek.map((dayName) => {
             const dayData = groupedMatches[dayName];
@@ -180,7 +169,6 @@ export default function Dashboard({ onNavigate, pageFilter = 'all' }) {
         </div>
       </div>
 
-      {/* MATCH DETAILS MODAL */}
       {selectedMatch && (
         <div className="fixed inset-0 bg-black/80 flex justify-center items-center z-[100] p-4" onClick={() => setSelectedMatch(null)}>
           <div className="bg-gray-800 rounded-xl shadow-lg p-6 border border-gray-700 max-w-2xl w-full relative max-h-[90vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
