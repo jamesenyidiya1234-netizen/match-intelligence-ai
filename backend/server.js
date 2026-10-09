@@ -229,9 +229,15 @@ async function initializeSystem() {
     await db.write(); console.log(`[$] Cycle Complete. Active predictions: ${db.data.predictions.length}`);
   }
 
-  // Run every 5 minutes to keep live scores updated
-  cron.schedule('*/5 * * * *', () => runDailyCycle());
-  await runDailyCycle();
+    // Safe Cron: Run every 30 minutes to avoid API rate limits
+  cron.schedule('*/30 * * * *', () => runDailyCycle());
+  
+  // On startup, only run immediately if DB is empty (prevents re-fetching on every Render restart)
+  if (db.data.predictions.length === 0 && db.data.history.length === 0) {
+    await runDailyCycle();
+  } else {
+    console.log('[$] Data already exists. Skipping startup fetch to save API limits.');
+  }
 
   app.get('/api/predictions', (req, res) => res.json({ predictions: db.data.predictions.sort((a, b) => new Date(a.date) - new Date(b.date)) }));
   app.get('/api/history', (req, res) => { const acc = db.data.history.length > 0 ? (db.data.history.filter(p => p.isCorrect).length / db.data.history.length * 100).toFixed(1) : 0; res.json({ history: db.data.history, accuracy: acc }); });
