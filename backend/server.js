@@ -9,7 +9,7 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// --- ELITE PREDICTION ENGINE (v4.1 Master Repair) ---
+// --- ELITE PREDICTION ENGINE ---
 class PredictionEngine {
   constructor() {
     this.footballWeights = { form: 0.20, injuries: 0.15, homeAway: 0.10, h2h: 0.10, tactics: 0.15, stats: 0.15, fatigue: 0.05, motivation: 0.05, transfers: 0.05 };
@@ -21,8 +21,8 @@ class PredictionEngine {
   analyzeMatch(matchData) {
     const { sport, homeTeam, awayTeam, injuries, h2h, league, fixtureId } = matchData;
     let homeScore = 0, awayScore = 0, missingDataPoints = [], warnings = [];
-
     let homeAttack = 1.35, homeDefense = 1.15, awayAttack = 1.15, awayDefense = 1.35;
+
     if (homeTeam.form && awayTeam.form) {
       homeScore += (this.calculateForm(homeTeam.form) * this.footballWeights.form);
       awayScore += (this.calculateForm(awayTeam.form) * this.footballWeights.form);
@@ -46,18 +46,11 @@ class PredictionEngine {
     let drawProb = 0;
     if (sport === 'football') { drawProb = 0.28 - (Math.abs(homeWinProb - awayWinProb) * 0.2); homeWinProb = homeWinProb * (1 - drawProb); awayWinProb = awayWinProb * (1 - drawProb); }
 
-    const markets = [];
-    const correctScores = [];
-    let homeExpGoals = 0, awayExpGoals = 0;
+    const markets = []; const correctScores = []; let homeExpGoals = 0, awayExpGoals = 0;
 
     if (sport === 'football') {
       homeExpGoals = (homeAttack * awayDefense) / 1.35; awayExpGoals = (awayAttack * homeDefense) / 1.35;
-      for (let h = 0; h <= 4; h++) {
-        for (let a = 0; a <= 4; a++) {
-          const prob = this.poissonProb(homeExpGoals, h) * this.poissonProb(awayExpGoals, a);
-          if (prob > 0.01) correctScores.push({ score: `${h}-${a}`, probability: prob });
-        }
-      }
+      for (let h = 0; h <= 4; h++) { for (let a = 0; a <= 4; a++) { const prob = this.poissonProb(homeExpGoals, h) * this.poissonProb(awayExpGoals, a); if (prob > 0.01) correctScores.push({ score: `${h}-${a}`, probability: prob }); } }
       correctScores.sort((a, b) => b.probability - a.probability);
       const totalExpGoals = homeExpGoals + awayExpGoals;
       const p0 = this.poissonProb(totalExpGoals, 0), p1 = this.poissonProb(totalExpGoals, 1), p2 = this.poissonProb(totalExpGoals, 2);
@@ -82,8 +75,7 @@ class PredictionEngine {
     let recommendation = (bestProb >= 70 && dataQuality !== 'LOW') ? 'HIGH-CONFIDENCE SELECTION' : 'NO STRONG PREDICTION';
 
     return {
-      fixtureId, sport, league, homeTeam: homeTeam.name, awayTeam: awayTeam.name,
-      homeTeamId: homeTeam.id, awayTeamId: awayTeam.id,
+      fixtureId, sport, league, homeTeam: homeTeam.name, awayTeam: awayTeam.name, homeTeamId: homeTeam.id, awayTeamId: awayTeam.id,
       allMarkets: markets.map(m => ({...m, probability: (m.probability * 100).toFixed(1)})),
       bestMarketString: bestMarket ? `${bestMarket.market} (${bestMarket.selection})` : 'No reliable market',
       topCorrectScores: correctScores.slice(0, 5).map(s => ({ score: s.score, probability: (s.probability * 100).toFixed(1) })),
@@ -109,8 +101,6 @@ async function initializeSystem() {
 
   async function runDailyCycle() {
     console.log(`[$] [${new Date().toLocaleTimeString()}] Running 24/7 Automation Cycle...`);
-    
-    // Generate realistic random form
     const genForm = () => Array.from({length: 5}, () => ['W','D','L'][Math.floor(Math.random()*3)]);
 
     // 1. FOOTBALL
@@ -119,14 +109,16 @@ async function initializeSystem() {
       try {
         const today = new Date(); const nextWeek = new Date(); nextWeek.setDate(today.getDate() + 7);
         const formatDate = (date) => date.toISOString().split('T')[0];
-        const res = await axios.get(`https://api.sportmonks.com/v3/football/fixtures/between/${formatDate(today)}/${formatDate(nextWeek)}?api_token=${footballKey}&include=participants;scores;league&per_page=200`);
+        const res = await axios.get(`https://api.sportmonks.com/v3/football/fixtures/between/${formatDate(today)}/${formatDate(nextWeek)}?api_token=${footballKey}&include=participants;scores;league&per_page=1000`);
         let newPredCount = 0;
 
         for (const fixture of res.data.data) {
           const matchId = `real_${fixture.id}`;
           const existingPrediction = db.data.predictions.find(p => p.fixtureId === matchId);
+          const matchStatus = fixture.state || 'NS'; // NS = Not Started
 
-          if (fixture.scores && fixture.scores.length > 0 && existingPrediction && !existingPrediction.isFinished) {
+          // If match is finished, move to history
+          if (matchStatus === 'FT' && existingPrediction && !existingPrediction.isFinished) {
              const homeScoreObj = fixture.scores.find(s => s.score.participant === 'home');
              const awayScoreObj = fixture.scores.find(s => s.score.participant === 'away');
              if (homeScoreObj && awayScoreObj) {
@@ -145,7 +137,19 @@ async function initializeSystem() {
              }
           }
 
-          if (!existingPrediction) {
+          // If match is LIVE, update the live score
+          if (existingPrediction && (matchStatus === 'LIVE' || matchStatus === 'HT' || matchStatus === 'ET' || matchStatus === 'BT' || matchStatus === 'P')) {
+             existingPrediction.status = 'LIVE';
+             const homeScoreObj = fixture.scores.find(s => s.score.participant === 'home');
+             const awayScoreObj = fixture.scores.find(s => s.score.participant === 'away');
+             if (homeScoreObj && awayScoreObj) {
+               existingPrediction.actualScore = `${homeScoreObj.score.goals}-${awayScoreObj.score.goals}`;
+             }
+             continue;
+          }
+
+          // If match hasn't started, create prediction
+          if (!existingPrediction && matchStatus === 'NS') {
             const homeTeamData = fixture.participants?.find(p => p.meta?.location === 'home');
             const awayTeamData = fixture.participants?.find(p => p.meta?.location === 'away');
             if (!homeTeamData || !awayTeamData) continue;
@@ -159,7 +163,7 @@ async function initializeSystem() {
             };
 
             const prediction = engine.analyzeMatch(mockMatch);
-            prediction.date = fixture.starting_at; prediction.status = fixture.state || 'Scheduled';
+            prediction.date = fixture.starting_at; prediction.status = 'Scheduled';
             db.data.predictions.push(prediction); newPredCount++;
           }
         }
@@ -175,15 +179,14 @@ async function initializeSystem() {
           headers: { 'x-apisports-key': basketballKey },
           params: { date: new Date().toISOString().split('T')[0] }
         });
-        const now = new Date();
-        const validGames = res.data.response.filter(g => g.date && new Date(g.date) > now);
         let newBballCount = 0;
 
-        for (const game of validGames) {
+        for (const game of res.data.response) {
           const matchId = `real_bball_${game.id}`;
           const existingPrediction = db.data.predictions.find(p => p.fixtureId === matchId);
+          const matchStatus = game.status?.short || 'NS';
 
-          if (game.status && game.status.short === 'FT' && existingPrediction && !existingPrediction.isFinished) {
+          if (matchStatus === 'FT' && existingPrediction && !existingPrediction.isFinished) {
             existingPrediction.isFinished = true;
             const homeScore = game.scores.home.total || 0; const awayScore = game.scores.away.total || 0;
             let actualWinner = 'Draw';
@@ -198,7 +201,14 @@ async function initializeSystem() {
             continue;
           }
 
-          if (!existingPrediction && !(game.status && game.status.short === 'FT')) {
+          if (existingPrediction && (matchStatus === 'LIVE' || matchStatus === 'Q1' || matchStatus === 'Q2' || matchStatus === 'Q3' || matchStatus === 'Q4' || matchStatus === 'HT')) {
+             existingPrediction.status = 'LIVE';
+             const homeScore = game.scores.home.total || 0; const awayScore = game.scores.away.total || 0;
+             existingPrediction.actualScore = `${homeScore}-${awayScore}`;
+             continue;
+          }
+
+          if (!existingPrediction && matchStatus === 'NS') {
             const mockMatch = {
               fixtureId: matchId, sport: 'basketball', league: game.league.name || 'Basketball League',
               matchDate: game.date,
@@ -208,7 +218,7 @@ async function initializeSystem() {
             };
 
             const prediction = engine.analyzeMatch(mockMatch);
-            prediction.date = game.date; prediction.status = game.status.short || 'Scheduled';
+            prediction.date = game.date; prediction.status = 'Scheduled';
             db.data.predictions.push(prediction); newBballCount++;
           }
         }
@@ -219,7 +229,8 @@ async function initializeSystem() {
     await db.write(); console.log(`[$] Cycle Complete. Active predictions: ${db.data.predictions.length}`);
   }
 
-  cron.schedule('0 * * * *', () => runDailyCycle());
+  // Run every 5 minutes to keep live scores updated
+  cron.schedule('*/5 * * * *', () => runDailyCycle());
   await runDailyCycle();
 
   app.get('/api/predictions', (req, res) => res.json({ predictions: db.data.predictions.sort((a, b) => new Date(a.date) - new Date(b.date)) }));
