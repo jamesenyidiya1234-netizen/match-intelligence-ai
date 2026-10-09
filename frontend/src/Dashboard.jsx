@@ -7,12 +7,23 @@ export default function Dashboard({ onNavigate, pageFilter = 'all' }) {
   const [searchQuery, setSearchQuery] = useState('');
 
   useEffect(() => {
-    axios.get('https://match-intelligence-ai.onrender.com/api/predictions')
-      .then(res => setPredictions(res.data.predictions))
-      .catch(err => console.error(err));
+    // Fetch data initially
+    const fetchData = () => {
+      axios.get('https://match-intelligence-ai.onrender.com/api/predictions')
+        .then(res => setPredictions(res.data.predictions))
+        .catch(err => console.error(err));
+    };
+    
+    fetchData(); // Fetch immediately on load
+    
+    // Set up auto-refresh every 30 seconds for live scores
+    const interval = setInterval(() => {
+      fetchData();
+    }, 30000);
+
+    return () => clearInterval(interval); // Cleanup on unmount
   }, []);
 
-  // Filter by Navigation (Football, Basketball, etc.)
   let filteredPredictions = [...predictions];
   const todayStr = new Date().toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' });
 
@@ -22,19 +33,16 @@ export default function Dashboard({ onNavigate, pageFilter = 'all' }) {
   else if (pageFilter === 'motd') filteredPredictions = filteredPredictions.sort((a, b) => b.confidenceScore - a.confidenceScore).slice(0, 1);
   else if (pageFilter === 'value') filteredPredictions = filteredPredictions.filter(p => p.bestMarketString?.includes('Over') || p.bestMarketString?.includes('BTTS'));
 
-    // Smart Filter by Search Query (Team name, League, or both teams)
   if (searchQuery.trim() !== '') {
     const q = searchQuery.toLowerCase();
     filteredPredictions = filteredPredictions.filter(p => {
       const home = p.homeTeam?.toLowerCase() || '';
       const away = p.awayTeam?.toLowerCase() || '';
       const league = p.league?.toLowerCase() || '';
-      
-      // Check if the search query matches any part of the teams or league
-      return home.includes(q) || away.includes(q) || league.includes(q) || 
-             (home + ' vs ' + away).includes(q) || (away + ' vs ' + home).includes(q);
+      return home.includes(q) || away.includes(q) || league.includes(q) || (home + ' vs ' + away).includes(q) || (away + ' vs ' + home).includes(q);
     });
   }
+
   const groupedMatches = filteredPredictions.reduce((acc, match) => {
     const dateStr = new Date(match.date).toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' });
     if (!acc[dateStr]) acc[dateStr] = [];
@@ -65,24 +73,13 @@ export default function Dashboard({ onNavigate, pageFilter = 'all' }) {
           ⚠️ Responsible Betting Notice: Sports predictions are probabilities, not guarantees.
         </div>
 
-        {/* SMART SEARCH BAR */}
         <div className="mb-8 flex flex-col md:flex-row gap-4 items-center justify-between bg-gray-800 p-4 rounded-xl border border-gray-700">
           <div className="relative w-full md:w-2/3">
-            <input 
-              type="text" 
-              placeholder="Search any team, match, or league..." 
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-              className="w-full bg-gray-900 text-white rounded-lg py-3 pl-10 pr-4 border border-gray-700 focus:border-emerald-500 outline-none transition"
-            />
+            <input type="text" placeholder="Search any team, match, or league..." value={searchQuery} onChange={(e) => setSearchQuery(e.target.value)} className="w-full bg-gray-900 text-white rounded-lg py-3 pl-10 pr-4 border border-gray-700 focus:border-emerald-500 outline-none transition" />
             <svg className="absolute left-3 top-3.5 h-5 w-5 text-gray-500" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" /></svg>
-            {searchQuery && (
-              <button onClick={() => setSearchQuery('')} className="absolute right-3 top-3.5 text-gray-500 hover:text-white text-xl">&times;</button>
-            )}
+            {searchQuery && (<button onClick={() => setSearchQuery('')} className="absolute right-3 top-3.5 text-gray-500 hover:text-white text-xl">&times;</button>)}
           </div>
-          <div className="text-sm text-gray-400">
-            {filteredPredictions.length} {filteredPredictions.length === 1 ? 'match' : 'matches'} found
-          </div>
+          <div className="text-sm text-gray-400">{filteredPredictions.length} {filteredPredictions.length === 1 ? 'match' : 'matches'} found</div>
         </div>
 
         {Object.keys(groupedMatches).length === 0 ? (
@@ -96,11 +93,18 @@ export default function Dashboard({ onNavigate, pageFilter = 'all' }) {
                   <div key={pred.fixtureId} onClick={() => setSelectedMatch(pred)} className="bg-gray-800 rounded-xl shadow-lg p-5 border border-gray-700 hover:border-emerald-500 transition-all cursor-pointer">
                     <div className="flex justify-between items-center mb-4 border-b border-gray-700 pb-3">
                       <span className="text-xs text-gray-400 font-bold">{pred.league}</span>
-                      <span className={`text-xs font-bold px-2 py-1 rounded ${pred.recommendation === 'NO STRONG PREDICTION' ? 'bg-gray-700 text-gray-400' : 'bg-emerald-900 text-emerald-400'}`}>{pred.status || 'Scheduled'}</span>
+                      <span className={`text-xs font-bold px-2 py-1 rounded ${pred.status === 'LIVE' ? 'bg-red-900 text-red-400 animate-pulse' : pred.status === 'FT' ? 'bg-gray-700 text-gray-400' : 'bg-emerald-900 text-emerald-400'}`}>
+                        {pred.status === 'LIVE' ? '🔴 LIVE' : pred.status || 'Scheduled'}
+                      </span>
                     </div>
                     <div className="flex justify-between items-center mb-6">
                       <div className="text-left w-2/5"><p className="font-bold text-xl">{pred.homeTeam}</p><p className="text-xs text-gray-500 mt-1">Home</p></div>
-                      <div className="text-center w-1/5"><p className="text-xs text-gray-400 mb-1">Pred. Score</p><p className="text-2xl font-bold text-white bg-gray-900 px-3 py-1 rounded-lg border border-gray-700">{pred.predictedScore || 'N/A'}</p></div>
+                      <div className="text-center w-1/5">
+                        <p className="text-xs mb-1 text-gray-400">{pred.actualScore ? 'Score' : 'Pred. Score'}</p>
+                        <p className={`text-2xl font-bold px-3 py-1 rounded-lg border ${pred.actualScore ? 'bg-gray-900 border-red-700 text-red-400' : 'bg-gray-900 border-gray-700 text-white'}`}>
+                          {pred.actualScore || pred.predictedScore || 'N/A'}
+                        </p>
+                      </div>
                       <div className="text-right w-2/5"><p className="font-bold text-xl">{pred.awayTeam}</p><p className="text-xs text-gray-500 mt-1">Away</p></div>
                     </div>
                     <div className="bg-gray-900/50 p-3 rounded-lg border border-gray-700 flex justify-between items-center">
