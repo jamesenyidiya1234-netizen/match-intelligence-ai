@@ -22,16 +22,19 @@ export default function Dashboard({ onNavigate, pageFilter = 'all' }) {
   else if (pageFilter === 'motd') filteredPredictions = filteredPredictions.sort((a, b) => b.confidenceScore - a.confidenceScore).slice(0, 1);
   else if (pageFilter === 'value') filteredPredictions = filteredPredictions.filter(p => p.bestMarketString?.includes('Over') || p.bestMarketString?.includes('BTTS'));
 
-  // Filter by Search Query (Team name, League, etc.)
+    // Smart Filter by Search Query (Team name, League, or both teams)
   if (searchQuery.trim() !== '') {
     const q = searchQuery.toLowerCase();
-    filteredPredictions = filteredPredictions.filter(p => 
-      p.homeTeam?.toLowerCase().includes(q) || 
-      p.awayTeam?.toLowerCase().includes(q) || 
-      p.league?.toLowerCase().includes(q)
-    );
+    filteredPredictions = filteredPredictions.filter(p => {
+      const home = p.homeTeam?.toLowerCase() || '';
+      const away = p.awayTeam?.toLowerCase() || '';
+      const league = p.league?.toLowerCase() || '';
+      
+      // Check if the search query matches any part of the teams or league
+      return home.includes(q) || away.includes(q) || league.includes(q) || 
+             (home + ' vs ' + away).includes(q) || (away + ' vs ' + home).includes(q);
+    });
   }
-
   const groupedMatches = filteredPredictions.reduce((acc, match) => {
     const dateStr = new Date(match.date).toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' });
     if (!acc[dateStr]) acc[dateStr] = [];
