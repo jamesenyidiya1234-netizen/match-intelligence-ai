@@ -6,7 +6,7 @@ export default function Dashboard({ onNavigate, pageFilter = 'all' }) {
   const [selectedMatch, setSelectedMatch] = useState(null);
 
   useEffect(() => {
-    axios.get('http://localhost:5001/api/predictions')
+   axios.get('https://match-intelligence-ai.onrender.com/api/predictions')
       .then(res => setPredictions(res.data.predictions))
       .catch(err => console.error(err));
   }, []);
