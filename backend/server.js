@@ -245,7 +245,7 @@ async function initializeSystem() {
   // --- TELEGRAM AUTOMATION INTEGRATION ---
 async function sendTelegramPredictions() {
   const botToken = process.env.TELEGRAM_BOT_TOKEN;
-  const chatId = '@YourChannelNameHere'; // REPLACE with your actual channel name (e.g., @MatchIntelligenceAI)
+  const chatId = '@MatchIntelligenceAI'; // REPLACE with your actual channel name (e.g., @MatchIntelligenceAI)
   
   if (!botToken) return; // Don't run if no token
 
@@ -270,6 +270,7 @@ async function sendTelegramPredictions() {
       parse_mode: 'Markdown'
     });
     console.log('[$] Sent predictions to Telegram.');
+        await sendTelegramPredictions();
   } catch (err) {
     console.error('[X] Telegram Error:', err.response?.data || err.message);
   }
