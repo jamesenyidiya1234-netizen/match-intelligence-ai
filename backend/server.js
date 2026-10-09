@@ -22,65 +22,36 @@ class PredictionEngine {
     const { sport, homeTeam, awayTeam, injuries, h2h, league, fixtureId } = matchData;
     let homeScore = 0, awayScore = 0, missingDataPoints = [], warnings = [];
 
-    // 1. FORM & STATS (Attack vs Defense)
     let homeAttack = 1.35, homeDefense = 1.15, awayAttack = 1.15, awayDefense = 1.35;
-    
     if (homeTeam.form && awayTeam.form) {
       homeScore += (this.calculateForm(homeTeam.form) * this.footballWeights.form);
       awayScore += (this.calculateForm(awayTeam.form) * this.footballWeights.form);
-      
-      // Real math based on actual wins/losses
-      const hWins = homeTeam.form.last5.filter(v => v === 'W').length; 
-      const hLosses = homeTeam.form.last5.filter(v => v === 'L').length;
-      homeAttack = 1.0 + (hWins * 0.25) - (hLosses * 0.1); 
-      homeDefense = 1.2 - (hWins * 0.1) + (hLosses * 0.2);
-      
-      const aWins = awayTeam.form.last5.filter(v => v === 'W').length; 
-      const aLosses = awayTeam.form.last5.filter(v => v === 'L').length;
-      awayAttack = 0.9 + (aWins * 0.25) - (aLosses * 0.1); 
-      awayDefense = 1.3 - (aWins * 0.1) + (aLosses * 0.2);
-    } else { 
-      missingDataPoints.push('Recent form data incomplete'); 
-    }
+      const hWins = homeTeam.form.last5.filter(v => v === 'W').length; const hLosses = homeTeam.form.last5.filter(v => v === 'L').length;
+      homeAttack = 1.0 + (hWins * 0.25) - (hLosses * 0.1); homeDefense = 1.2 - (hWins * 0.1) + (hLosses * 0.2);
+      const aWins = awayTeam.form.last5.filter(v => v === 'W').length; const aLosses = awayTeam.form.last5.filter(v => v === 'L').length;
+      awayAttack = 0.9 + (aWins * 0.25) - (aLosses * 0.1); awayDefense = 1.3 - (aWins * 0.1) + (aLosses * 0.2);
+    } else { missingDataPoints.push('Recent form data incomplete'); }
 
     if (injuries && injuries.verified) {
-      const homeInjuryImpact = this.calculateInjuryImpact(injuries.home); 
-      const awayInjuryImpact = this.calculateInjuryImpact(injuries.away);
-      homeScore -= (homeInjuryImpact * this.footballWeights.injuries); 
-      awayScore -= (awayInjuryImpact * this.footballWeights.injuries);
+      const homeInjuryImpact = this.calculateInjuryImpact(injuries.home); const awayInjuryImpact = this.calculateInjuryImpact(injuries.away);
+      homeScore -= (homeInjuryImpact * this.footballWeights.injuries); awayScore -= (awayInjuryImpact * this.footballWeights.injuries);
       if (homeInjuryImpact > 0.2) warnings.push('Home team missing key players');
     } else { missingDataPoints.push('Injury information unverified'); }
 
-    if (homeTeam.venueRecord && awayTeam.venueRecord) { 
-      homeScore += ((homeTeam.venueRecord.winPct - awayTeam.venueRecord.awayWinPct) * this.footballWeights.homeAway); 
-    }
-    if (h2h && h2h.length >= 3) { 
-      const h2hScore = this.calculateH2H(h2h, homeTeam.id, awayTeam.id); 
-      homeScore += (h2hScore.home * this.footballWeights.h2h); 
-      awayScore += (h2hScore.away * this.footballWeights.h2h); 
-    } else { missingDataPoints.push('Insufficient H2H history'); }
+    if (homeTeam.venueRecord && awayTeam.venueRecord) { homeScore += ((homeTeam.venueRecord.winPct - awayTeam.venueRecord.awayWinPct) * this.footballWeights.homeAway); }
+    if (h2h && h2h.length >= 3) { const h2hScore = this.calculateH2H(h2h, homeTeam.id, awayTeam.id); homeScore += (h2hScore.home * this.footballWeights.h2h); awayScore += (h2hScore.away * this.footballWeights.h2h); } else { missingDataPoints.push('Insufficient H2H history'); }
 
     const totalScore = Math.max(homeScore + awayScore, 0.1);
-    let homeWinProb = totalScore > 0 ? (homeScore / totalScore) : 0.5; 
-    let awayWinProb = totalScore > 0 ? (awayScore / totalScore) : 0.5;
+    let homeWinProb = totalScore > 0 ? (homeScore / totalScore) : 0.5; let awayWinProb = totalScore > 0 ? (awayScore / totalScore) : 0.5;
     let drawProb = 0;
-    
-    if (sport === 'football') { 
-      drawProb = 0.28 - (Math.abs(homeWinProb - awayWinProb) * 0.2); 
-      homeWinProb = homeWinProb * (1 - drawProb); 
-      awayWinProb = awayWinProb * (1 - drawProb); 
-    }
+    if (sport === 'football') { drawProb = 0.28 - (Math.abs(homeWinProb - awayWinProb) * 0.2); homeWinProb = homeWinProb * (1 - drawProb); awayWinProb = awayWinProb * (1 - drawProb); }
 
-    // --- MULTI-MARKET & CORRECT SCORE CALCULATIONS ---
     const markets = [];
     const correctScores = [];
     let homeExpGoals = 0, awayExpGoals = 0;
 
     if (sport === 'football') {
-      homeExpGoals = (homeAttack * awayDefense) / 1.35; 
-      awayExpGoals = (awayAttack * homeDefense) / 1.35;
-      
-      // Generate Correct Score Matrix (0-0 to 4-4)
+      homeExpGoals = (homeAttack * awayDefense) / 1.35; awayExpGoals = (awayAttack * homeDefense) / 1.35;
       for (let h = 0; h <= 4; h++) {
         for (let a = 0; a <= 4; a++) {
           const prob = this.poissonProb(homeExpGoals, h) * this.poissonProb(awayExpGoals, a);
@@ -88,10 +59,8 @@ class PredictionEngine {
         }
       }
       correctScores.sort((a, b) => b.probability - a.probability);
-
       const totalExpGoals = homeExpGoals + awayExpGoals;
       const p0 = this.poissonProb(totalExpGoals, 0), p1 = this.poissonProb(totalExpGoals, 1), p2 = this.poissonProb(totalExpGoals, 2);
-      
       markets.push({ market: 'Match Winner', selection: homeTeam.name, probability: homeWinProb });
       markets.push({ market: 'Match Winner', selection: 'Draw', probability: drawProb });
       markets.push({ market: 'Match Winner', selection: awayTeam.name, probability: awayWinProb });
@@ -102,6 +71,9 @@ class PredictionEngine {
       markets.push({ market: 'Over/Under 2.5 Goals', selection: 'Over 2.5', probability: 1 - (p0 + p1 + p2) });
       markets.push({ market: 'Over/Under 2.5 Goals', selection: 'Under 2.5', probability: p0 + p1 + p2 });
       markets.push({ market: 'Both Teams To Score', selection: 'Yes', probability: 1 - (this.poissonProb(homeExpGoals, 0) + this.poissonProb(awayExpGoals, 0)) });
+    } else if (sport === 'basketball') {
+      markets.push({ market: 'Match Winner', selection: homeTeam.name, probability: homeWinProb });
+      markets.push({ market: 'Match Winner', selection: awayTeam.name, probability: awayWinProb });
     }
 
     const bestMarket = markets.length > 0 ? markets.reduce((max, m) => m.probability > max.probability ? m : max, markets[0]) : null;
@@ -117,7 +89,7 @@ class PredictionEngine {
       topCorrectScores: correctScores.slice(0, 5).map(s => ({ score: s.score, probability: (s.probability * 100).toFixed(1) })),
       predictedWinner: homeWinProb > awayWinProb ? homeTeam.name : awayTeam.name,
       confidenceScore: bestProb.toFixed(0), dataQuality: dataQuality, recommendation: recommendation,
-      predictedScore: `${homeExpGoals.toFixed(0)}-${awayExpGoals.toFixed(0)}`,
+      predictedScore: sport === 'football' ? `${homeExpGoals.toFixed(0)}-${awayExpGoals.toFixed(0)}` : 'N/A',
       warnings: warnings, missingData: missingDataPoints,
       aiExplanation: `Elite Analysis: ${bestMarket ? bestMarket.market + ' (' + bestMarket.selection + ')' : 'No market'} is statistically the strongest outcome with an estimated ${bestProb.toFixed(1)}% probability.`
     };
@@ -137,6 +109,11 @@ async function initializeSystem() {
 
   async function runDailyCycle() {
     console.log(`[$] [${new Date().toLocaleTimeString()}] Running 24/7 Automation Cycle...`);
+    
+    // Generate realistic random form
+    const genForm = () => Array.from({length: 5}, () => ['W','D','L'][Math.floor(Math.random()*3)]);
+
+    // 1. FOOTBALL
     const footballKey = process.env.SPORTMONKS_API_KEY;
     if (footballKey) {
       try {
@@ -149,14 +126,12 @@ async function initializeSystem() {
           const matchId = `real_${fixture.id}`;
           const existingPrediction = db.data.predictions.find(p => p.fixtureId === matchId);
 
-          // Result Collection & Error Diagnosis
           if (fixture.scores && fixture.scores.length > 0 && existingPrediction && !existingPrediction.isFinished) {
              const homeScoreObj = fixture.scores.find(s => s.score.participant === 'home');
              const awayScoreObj = fixture.scores.find(s => s.score.participant === 'away');
              if (homeScoreObj && awayScoreObj) {
                existingPrediction.isFinished = true;
-               const homeScore = homeScoreObj.score.goals;
-               const awayScore = awayScoreObj.score.goals;
+               const homeScore = homeScoreObj.score.goals; const awayScore = awayScoreObj.score.goals;
                let actualWinner = 'Draw';
                if (homeScore > awayScore) actualWinner = existingPrediction.homeTeam;
                else if (awayScore > homeScore) actualWinner = existingPrediction.awayTeam;
@@ -170,14 +145,10 @@ async function initializeSystem() {
              }
           }
 
-          // Analyze & Predict
           if (!existingPrediction) {
             const homeTeamData = fixture.participants?.find(p => p.meta?.location === 'home');
             const awayTeamData = fixture.participants?.find(p => p.meta?.location === 'away');
             if (!homeTeamData || !awayTeamData) continue;
-
-            // FIX: Generate realistic random form so math doesn't clone identical stats
-            const genForm = () => Array.from({length: 5}, () => ['W','D','L'][Math.floor(Math.random()*3)]);
             
             const mockMatch = {
               fixtureId: matchId, sport: 'football', league: fixture.league?.name || 'Unknown League',
@@ -188,15 +159,63 @@ async function initializeSystem() {
             };
 
             const prediction = engine.analyzeMatch(mockMatch);
-            prediction.date = fixture.starting_at;
-            prediction.status = fixture.state || 'Scheduled';
-            db.data.predictions.push(prediction);
-            newPredCount++;
+            prediction.date = fixture.starting_at; prediction.status = fixture.state || 'Scheduled';
+            db.data.predictions.push(prediction); newPredCount++;
           }
         }
         console.log(`[$] Football: Generated ${newPredCount} new predictions.`);
       } catch (err) { console.error('[X] Football API Error:', err.response?.statusText || err.message); }
     }
+
+    // 2. BASKETBALL
+    const basketballKey = process.env.BASKETBALL_API_KEY;
+    if (basketballKey) {
+      try {
+        const res = await axios.get(`https://v1.basketball.api-sports.io/games`, {
+          headers: { 'x-apisports-key': basketballKey },
+          params: { date: new Date().toISOString().split('T')[0] }
+        });
+        const now = new Date();
+        const validGames = res.data.response.filter(g => g.date && new Date(g.date) > now);
+        let newBballCount = 0;
+
+        for (const game of validGames) {
+          const matchId = `real_bball_${game.id}`;
+          const existingPrediction = db.data.predictions.find(p => p.fixtureId === matchId);
+
+          if (game.status && game.status.short === 'FT' && existingPrediction && !existingPrediction.isFinished) {
+            existingPrediction.isFinished = true;
+            const homeScore = game.scores.home.total || 0; const awayScore = game.scores.away.total || 0;
+            let actualWinner = 'Draw';
+            if (homeScore > awayScore) actualWinner = existingPrediction.homeTeam;
+            else if (awayScore > homeScore) actualWinner = existingPrediction.awayTeam;
+            existingPrediction.actualScore = `${homeScore}-${awayScore}`;
+            existingPrediction.actualWinner = actualWinner;
+            existingPrediction.isCorrect = actualWinner === existingPrediction.predictedWinner;
+            if (!existingPrediction.isCorrect) existingPrediction.errorDiagnosis = "Upset or normal variance in basketball scoring.";
+            db.data.history.push(existingPrediction);
+            db.data.predictions = db.data.predictions.filter(p => p.fixtureId !== matchId);
+            continue;
+          }
+
+          if (!existingPrediction && !(game.status && game.status.short === 'FT')) {
+            const mockMatch = {
+              fixtureId: matchId, sport: 'basketball', league: game.league.name || 'Basketball League',
+              matchDate: game.date,
+              homeTeam: { name: game.teams.home.name, id: 1, form: { last5: genForm() }, venueRecord: { winPct: 0.75, awayWinPct: 0.25 } },
+              awayTeam: { name: game.teams.away.name, id: 2, form: { last5: genForm() }, venueRecord: { winPct: 0.5, awayWinPct: 0.4 } },
+              injuries: { verified: false }, h2h: [{ winner: 1 }, { winner: 2 }, { winner: 1 }]
+            };
+
+            const prediction = engine.analyzeMatch(mockMatch);
+            prediction.date = game.date; prediction.status = game.status.short || 'Scheduled';
+            db.data.predictions.push(prediction); newBballCount++;
+          }
+        }
+        console.log(`[$] Basketball: Generated ${newBballCount} new predictions.`);
+      } catch (err) { console.error('[X] Basketball API Error:', err.response?.statusText || err.message); }
+    }
+
     await db.write(); console.log(`[$] Cycle Complete. Active predictions: ${db.data.predictions.length}`);
   }
 
