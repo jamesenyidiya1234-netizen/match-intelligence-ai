@@ -6,13 +6,21 @@ export default function Dashboard({ onNavigate, pageFilter = 'all' }) {
   const [selectedMatch, setSelectedMatch] = useState(null);
   const [searchQuery, setSearchQuery] = useState('');
 
-  useEffect(() => {
-    // Fetch data initially
-    const fetchData = () => {
-      axios.get('https://match-intelligence-ai.onrender.com/api/predictions')
-        .then(res => setPredictions(res.data.predictions))
-        .catch(err => console.error(err));
+    useEffect(() => {
+    const fetchData = async () => {
+      try {
+        const res = await axios.get('https://match-intelligence-ai.onrender.com/api/predictions');
+        setPredictions(res.data.predictions);
+      } catch (err) {
+        console.error("API Error:", err);
+        setPredictions([]); // Set to empty so UI shows "No matches found" instead of infinite loading
+      }
     };
+    
+    fetchData();
+    const interval = setInterval(fetchData, 30000);
+    return () => clearInterval(interval);
+  }, []);
     
     fetchData(); // Fetch immediately on load
     
