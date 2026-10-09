@@ -6,13 +6,12 @@ export default function Dashboard({ onNavigate, pageFilter = 'all' }) {
   const [selectedMatch, setSelectedMatch] = useState(null);
 
   useEffect(() => {
-    axios.get('https://match-intelligence-ai.onrender.com/api/predictions') // Use your Render URL
+    axios.get('https://match-intelligence-ai.onrender.com/api/predictions')
       .then(res => setPredictions(res.data.predictions))
       .catch(err => console.error(err));
   }, []);
 
   let filteredPredictions = [...predictions];
-  // ... (keep existing filters if you want, or simplify to 'all')
   
   const groupedMatches = filteredPredictions.reduce((acc, match) => {
     const dateStr = new Date(match.date).toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' });
@@ -69,7 +68,7 @@ export default function Dashboard({ onNavigate, pageFilter = 'all' }) {
                       
                       <div className="text-center w-1/5">
                         <p className="text-xs text-gray-400 mb-1">Predicted Score</p>
-                        <p className="text-2xl font-bold text-white bg-gray-900 px-3 py-1 rounded-lg border border-gray-700">{pred.predictedScore}</p>
+                        <p className="text-2xl font-bold text-white bg-gray-900 px-3 py-1 rounded-lg border border-gray-700">{pred.predictedScore || 'N/A'}</p>
                       </div>
 
                       <div className="text-right w-2/5">
@@ -78,15 +77,15 @@ export default function Dashboard({ onNavigate, pageFilter = 'all' }) {
                       </div>
                     </div>
 
-                    {/* Best Market & Probability */}
+                    {/* Best Market & Probability - FIXED MAPPING */}
                     <div className="bg-gray-900/50 p-3 rounded-lg border border-gray-700 flex justify-between items-center">
                       <div>
                         <p className="text-xs text-gray-500 uppercase tracking-wider">Best Market</p>
-                        <p className="text-sm text-white font-bold">{pred.bestMarket?.market} ({pred.bestMarket?.selection})</p>
+                        <p className="text-sm text-white font-bold">{pred.bestMarketString || 'No reliable market'}</p>
                       </div>
                       <div className="text-right">
                         <p className="text-xs text-gray-500 uppercase tracking-wider">Probability</p>
-                        <span className="text-2xl font-mono text-emerald-400">{pred.confidenceScore}%</span>
+                        <span className="text-2xl font-mono text-emerald-400">{pred.confidenceScore || '0'}%</span>
                       </div>
                     </div>
                     
