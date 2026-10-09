@@ -119,7 +119,7 @@ async function initializeSystem() {
       try {
         const today = new Date(); const nextWeek = new Date(); nextWeek.setDate(today.getDate() + 7);
         const formatDate = (date) => date.toISOString().split('T')[0];
-        const res = await axios.get(`https://api.sportmonks.com/v3/football/fixtures/between/${formatDate(today)}/${formatDate(nextWeek)}?api_token=${footballKey}&include=participants;scores;league&per_page=1000`);
+        const res = await axios.get(`https://api.sportmonks.com/v3/football/fixtures/between/${formatDate(today)}/${formatDate(nextWeek)}?api_token=${footballKey}&include=participants;scores;league&per_page=200`);
         let newPredCount = 0;
 
         for (const fixture of res.data.data) {
