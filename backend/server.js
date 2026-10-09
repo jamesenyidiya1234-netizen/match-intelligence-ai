@@ -275,6 +275,16 @@ async function sendTelegramPredictions() {
     console.error('[X] Telegram Error:', err.response?.data || err.message);
   }
 }
+  // --- MANUAL TELEGRAM TRIGGER ---
+app.get('/api/trigger-telegram', async (req, res) => {
+  try {
+    console.log('[!] Manual Telegram trigger received.');
+    await sendTelegramPredictions();
+    res.json({ message: 'Telegram prediction trigger sent successfully! Check your channel.' });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to send Telegram message.', details: err.message });
+  }
+});
 
   app.listen(process.env.PORT || 5001, () => console.log(`Match Intelligence AI 24/7 Server running.`));
 }
