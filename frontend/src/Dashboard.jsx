@@ -4,14 +4,15 @@ import axios from 'axios';
 export default function Dashboard({ onNavigate, pageFilter = 'all' }) {
   const [predictions, setPredictions] = useState([]);
   const [selectedMatch, setSelectedMatch] = useState(null);
+  const [searchQuery, setSearchQuery] = useState('');
 
   useEffect(() => {
-    // Using your live Render backend URL
     axios.get('https://match-intelligence-ai.onrender.com/api/predictions')
       .then(res => setPredictions(res.data.predictions))
       .catch(err => console.error(err));
   }, []);
 
+  // Filter by Navigation (Football, Basketball, etc.)
   let filteredPredictions = [...predictions];
   const todayStr = new Date().toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' });
 
@@ -20,6 +21,16 @@ export default function Dashboard({ onNavigate, pageFilter = 'all' }) {
   else if (pageFilter === 'today') filteredPredictions = filteredPredictions.filter(p => new Date(p.date).toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' }) === todayStr);
   else if (pageFilter === 'motd') filteredPredictions = filteredPredictions.sort((a, b) => b.confidenceScore - a.confidenceScore).slice(0, 1);
   else if (pageFilter === 'value') filteredPredictions = filteredPredictions.filter(p => p.bestMarketString?.includes('Over') || p.bestMarketString?.includes('BTTS'));
+
+  // Filter by Search Query (Team name, League, etc.)
+  if (searchQuery.trim() !== '') {
+    const q = searchQuery.toLowerCase();
+    filteredPredictions = filteredPredictions.filter(p => 
+      p.homeTeam?.toLowerCase().includes(q) || 
+      p.awayTeam?.toLowerCase().includes(q) || 
+      p.league?.toLowerCase().includes(q)
+    );
+  }
 
   const groupedMatches = filteredPredictions.reduce((acc, match) => {
     const dateStr = new Date(match.date).toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' });
@@ -51,8 +62,28 @@ export default function Dashboard({ onNavigate, pageFilter = 'all' }) {
           ⚠️ Responsible Betting Notice: Sports predictions are probabilities, not guarantees.
         </div>
 
+        {/* SMART SEARCH BAR */}
+        <div className="mb-8 flex flex-col md:flex-row gap-4 items-center justify-between bg-gray-800 p-4 rounded-xl border border-gray-700">
+          <div className="relative w-full md:w-2/3">
+            <input 
+              type="text" 
+              placeholder="Search any team, match, or league..." 
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              className="w-full bg-gray-900 text-white rounded-lg py-3 pl-10 pr-4 border border-gray-700 focus:border-emerald-500 outline-none transition"
+            />
+            <svg className="absolute left-3 top-3.5 h-5 w-5 text-gray-500" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" /></svg>
+            {searchQuery && (
+              <button onClick={() => setSearchQuery('')} className="absolute right-3 top-3.5 text-gray-500 hover:text-white text-xl">&times;</button>
+            )}
+          </div>
+          <div className="text-sm text-gray-400">
+            {filteredPredictions.length} {filteredPredictions.length === 1 ? 'match' : 'matches'} found
+          </div>
+        </div>
+
         {Object.keys(groupedMatches).length === 0 ? (
-          <p className="text-gray-400 text-center text-xl py-10">Loading real matches or none found for this filter...</p>
+          <p className="text-gray-400 text-center text-xl py-10">No matches found. Try a different search or filter.</p>
         ) : (
           Object.keys(groupedMatches).map(dateStr => (
             <div key={dateStr} className="mb-12">
