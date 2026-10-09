@@ -10,22 +10,18 @@ function App() {
     if (currentPage === 'History') return <History onNavigate={setCurrentPage} />;
     if (currentPage === 'Settings') return <Settings onNavigate={setCurrentPage} />;
     
-    // All these pages will use the Dashboard, but pass a filter to it
-    if (currentPage === 'Football') return <Dashboard onNavigate={setCurrentPage} pageFilter="football" />;
-    if (currentPage === 'Basketball') return <Dashboard onNavigate={setCurrentPage} pageFilter="basketball" />;
-    if (currentPage === 'Today\'s Matches') return <Dashboard onNavigate={setCurrentPage} pageFilter="today" />;
-    if (currentPage === 'Match of the Day') return <Dashboard onNavigate={setCurrentPage} pageFilter="motd" />;
-    if (currentPage === 'Value Opportunities') return <Dashboard onNavigate={setCurrentPage} pageFilter="value" />;
-    
-    // Default Dashboard
-    return <Dashboard onNavigate={setCurrentPage} pageFilter="all" />;
+    // For all other pages, we pass the filter to the Dashboard
+    let filter = 'all';
+    if (currentPage === 'Football') filter = 'football';
+    else if (currentPage === 'Basketball') filter = 'basketball';
+    else if (currentPage === "Today's Matches") filter = 'today';
+    else if (currentPage === 'Match of the Day') filter = 'motd';
+    else if (currentPage === 'Value Opportunities') filter = 'value';
+
+    return <Dashboard onNavigate={setCurrentPage} pageFilter={filter} />;
   };
 
-  return (
-    <div>
-      {renderPage()}
-    </div>
-  );
+  return <div>{renderPage()}</div>;
 }
 
 export default App;
