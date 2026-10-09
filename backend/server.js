@@ -242,6 +242,39 @@ async function initializeSystem() {
   app.get('/api/predictions', (req, res) => res.json({ predictions: db.data.predictions.sort((a, b) => new Date(a.date) - new Date(b.date)) }));
   app.get('/api/history', (req, res) => { const acc = db.data.history.length > 0 ? (db.data.history.filter(p => p.isCorrect).length / db.data.history.length * 100).toFixed(1) : 0; res.json({ history: db.data.history, accuracy: acc }); });
 
+  // --- TELEGRAM AUTOMATION INTEGRATION ---
+async function sendTelegramPredictions() {
+  const botToken = process.env.TELEGRAM_BOT_TOKEN;
+  const chatId = '@YourChannelNameHere'; // REPLACE with your actual channel name (e.g., @MatchIntelligenceAI)
+  
+  if (!botToken) return; // Don't run if no token
+
+  try {
+    // Get top 3 highest confidence predictions
+    const topPicks = await Prediction.find({ status: 'Scheduled' }).sort({ confidenceScore: -1 }).limit(3);
+    
+    if (topPicks.length === 0) return;
+
+    let message = `⚽️ *MATCH INTELLIGENCE AI - TOP PICKS* ⚽️\n\n`;
+    topPicks.forEach((pick, index) => {
+      message += `*${index + 1}. ${pick.homeTeam} vs ${pick.awayTeam}*\n`;
+      message += `League: ${pick.league}\n`;
+      message += `Best Market: ${pick.bestMarketString} (${pick.confidenceScore}%)\n`;
+      message += `Predicted Score: ${pick.predictedScore}\n\n`;
+    });
+    message += `⚠️ Bet responsibly. Probabilities, not guarantees.`;
+
+    await axios.post(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+      chat_id: chatId,
+      text: message,
+      parse_mode: 'Markdown'
+    });
+    console.log('[$] Sent predictions to Telegram.');
+  } catch (err) {
+    console.error('[X] Telegram Error:', err.response?.data || err.message);
+  }
+}
+
   app.listen(process.env.PORT || 5001, () => console.log(`Match Intelligence AI 24/7 Server running.`));
 }
 
