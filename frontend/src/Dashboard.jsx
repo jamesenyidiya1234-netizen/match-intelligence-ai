@@ -6,13 +6,21 @@ export default function Dashboard({ onNavigate, pageFilter = 'all' }) {
   const [selectedMatch, setSelectedMatch] = useState(null);
 
   useEffect(() => {
+    // Using your live Render backend URL
     axios.get('https://match-intelligence-ai.onrender.com/api/predictions')
       .then(res => setPredictions(res.data.predictions))
       .catch(err => console.error(err));
   }, []);
 
   let filteredPredictions = [...predictions];
-  
+  const todayStr = new Date().toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' });
+
+  if (pageFilter === 'football') filteredPredictions = filteredPredictions.filter(p => p.sport === 'football');
+  else if (pageFilter === 'basketball') filteredPredictions = filteredPredictions.filter(p => p.sport === 'basketball');
+  else if (pageFilter === 'today') filteredPredictions = filteredPredictions.filter(p => new Date(p.date).toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' }) === todayStr);
+  else if (pageFilter === 'motd') filteredPredictions = filteredPredictions.sort((a, b) => b.confidenceScore - a.confidenceScore).slice(0, 1);
+  else if (pageFilter === 'value') filteredPredictions = filteredPredictions.filter(p => p.bestMarketString?.includes('Over') || p.bestMarketString?.includes('BTTS'));
+
   const groupedMatches = filteredPredictions.reduce((acc, match) => {
     const dateStr = new Date(match.date).toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' });
     if (!acc[dateStr]) acc[dateStr] = [];
@@ -22,12 +30,16 @@ export default function Dashboard({ onNavigate, pageFilter = 'all' }) {
 
   return (
     <div className="min-h-screen bg-gray-900 text-white">
-      
       <nav className="bg-gray-950 border-b border-gray-800 p-4 sticky top-0 z-50">
         <div className="max-w-7xl mx-auto flex justify-between items-center">
           <h1 className="text-xl font-bold text-emerald-400 tracking-wider">MATCH INTELLIGENCE AI</h1>
           <ul className="hidden md:flex gap-6 text-sm text-gray-400">
-            <li className="hover:text-emerald-400 cursor-pointer border-b-2 border-emerald-400 pb-1" onClick={() => onNavigate('Dashboard')}>Dashboard</li>
+            <li className={`hover:text-emerald-400 cursor-pointer ${pageFilter === 'all' ? 'border-b-2 border-emerald-400 pb-1' : ''}`} onClick={() => onNavigate('Dashboard')}>Dashboard</li>
+            <li className={`hover:text-white cursor-pointer ${pageFilter === 'football' ? 'border-b-2 border-emerald-400 pb-1' : ''}`} onClick={() => onNavigate('Football')}>Football</li>
+            <li className={`hover:text-white cursor-pointer ${pageFilter === 'basketball' ? 'border-b-2 border-emerald-400 pb-1' : ''}`} onClick={() => onNavigate('Basketball')}>Basketball</li>
+            <li className={`hover:text-white cursor-pointer ${pageFilter === 'today' ? 'border-b-2 border-emerald-400 pb-1' : ''}`} onClick={() => onNavigate('Today\'s Matches')}>Today's Matches</li>
+            <li className={`hover:text-white cursor-pointer ${pageFilter === 'motd' ? 'border-b-2 border-emerald-400 pb-1' : ''}`} onClick={() => onNavigate('Match of the Day')}>Match of the Day</li>
+            <li className={`hover:text-white cursor-pointer ${pageFilter === 'value' ? 'border-b-2 border-emerald-400 pb-1' : ''}`} onClick={() => onNavigate('Value Opportunities')}>Value Opportunities</li>
             <li className="hover:text-white cursor-pointer" onClick={() => onNavigate('History')}>History</li>
             <li className="hover:text-white cursor-pointer" onClick={() => onNavigate('Settings')}>Settings</li>
           </ul>
@@ -40,57 +52,27 @@ export default function Dashboard({ onNavigate, pageFilter = 'all' }) {
         </div>
 
         {Object.keys(groupedMatches).length === 0 ? (
-          <p className="text-gray-400 text-center text-xl py-10">Loading real matches...</p>
+          <p className="text-gray-400 text-center text-xl py-10">Loading real matches or none found for this filter...</p>
         ) : (
           Object.keys(groupedMatches).map(dateStr => (
             <div key={dateStr} className="mb-12">
               <h3 className="text-xl font-semibold mb-6 border-l-4 border-emerald-500 pl-3">{dateStr}</h3>
-              
               <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
                 {groupedMatches[dateStr].map((pred) => (
-                  
                   <div key={pred.fixtureId} onClick={() => setSelectedMatch(pred)} className="bg-gray-800 rounded-xl shadow-lg p-5 border border-gray-700 hover:border-emerald-500 transition-all cursor-pointer">
-                    
-                    {/* Top Section: League & Status */}
                     <div className="flex justify-between items-center mb-4 border-b border-gray-700 pb-3">
                       <span className="text-xs text-gray-400 font-bold">{pred.league}</span>
-                      <span className={`text-xs font-bold px-2 py-1 rounded ${pred.recommendation === 'NO STRONG PREDICTION' ? 'bg-gray-700 text-gray-400' : 'bg-emerald-900 text-emerald-400'}`}>
-                        {pred.status || 'Scheduled'}
-                      </span>
+                      <span className={`text-xs font-bold px-2 py-1 rounded ${pred.recommendation === 'NO STRONG PREDICTION' ? 'bg-gray-700 text-gray-400' : 'bg-emerald-900 text-emerald-400'}`}>{pred.status || 'Scheduled'}</span>
                     </div>
-
-                    {/* Teams & Predicted Score */}
                     <div className="flex justify-between items-center mb-6">
-                      <div className="text-left w-2/5">
-                        <p className="font-bold text-xl">{pred.homeTeam}</p>
-                        <p className="text-xs text-gray-500 mt-1">Home</p>
-                      </div>
-                      
-                      <div className="text-center w-1/5">
-                        <p className="text-xs text-gray-400 mb-1">Predicted Score</p>
-                        <p className="text-2xl font-bold text-white bg-gray-900 px-3 py-1 rounded-lg border border-gray-700">{pred.predictedScore || 'N/A'}</p>
-                      </div>
-
-                      <div className="text-right w-2/5">
-                        <p className="font-bold text-xl">{pred.awayTeam}</p>
-                        <p className="text-xs text-gray-500 mt-1">Away</p>
-                      </div>
+                      <div className="text-left w-2/5"><p className="font-bold text-xl">{pred.homeTeam}</p><p className="text-xs text-gray-500 mt-1">Home</p></div>
+                      <div className="text-center w-1/5"><p className="text-xs text-gray-400 mb-1">Pred. Score</p><p className="text-2xl font-bold text-white bg-gray-900 px-3 py-1 rounded-lg border border-gray-700">{pred.predictedScore || 'N/A'}</p></div>
+                      <div className="text-right w-2/5"><p className="font-bold text-xl">{pred.awayTeam}</p><p className="text-xs text-gray-500 mt-1">Away</p></div>
                     </div>
-
-                    {/* Best Market & Probability - FIXED MAPPING */}
                     <div className="bg-gray-900/50 p-3 rounded-lg border border-gray-700 flex justify-between items-center">
-                      <div>
-                        <p className="text-xs text-gray-500 uppercase tracking-wider">Best Market</p>
-                        <p className="text-sm text-white font-bold">{pred.bestMarketString || 'No reliable market'}</p>
-                      </div>
-                      <div className="text-right">
-                        <p className="text-xs text-gray-500 uppercase tracking-wider">Probability</p>
-                        <span className="text-2xl font-mono text-emerald-400">{pred.confidenceScore || '0'}%</span>
-                      </div>
+                      <div><p className="text-xs text-gray-500 uppercase tracking-wider">Best Market</p><p className="text-sm text-white font-bold">{pred.bestMarketString || 'No reliable market'}</p></div>
+                      <div className="text-right"><p className="text-xs text-gray-500 uppercase tracking-wider">Probability</p><span className="text-2xl font-mono text-emerald-400">{pred.confidenceScore || '0'}%</span></div>
                     </div>
-                    
-                    <p className="text-xs text-gray-500 mt-3 text-center">Click for full analysis & correct scores</p>
-
                   </div>
                 ))}
               </div>
@@ -99,63 +81,38 @@ export default function Dashboard({ onNavigate, pageFilter = 'all' }) {
         )}
       </div>
 
-      {/* MATCH DETAILS MODAL */}
       {selectedMatch && (
         <div className="fixed inset-0 bg-black/80 flex justify-center items-center z-[100] p-4" onClick={() => setSelectedMatch(null)}>
           <div className="bg-gray-800 rounded-xl shadow-lg p-6 border border-gray-700 max-w-2xl w-full relative max-h-[90vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
-            
             <button className="absolute top-4 right-4 text-gray-400 hover:text-white text-xl" onClick={() => setSelectedMatch(null)}>✕</button>
-            
-            {/* Match Overview */}
             <div className="text-center mb-6 border-b border-gray-700 pb-4">
               <span className="text-xs font-semibold bg-blue-900 text-blue-300 px-2 py-1 rounded">{selectedMatch.league}</span>
               <h2 className="text-3xl font-bold mt-3">{selectedMatch.homeTeam} vs {selectedMatch.awayTeam}</h2>
               <p className="text-gray-400 text-sm mt-1">{new Date(selectedMatch.date).toLocaleString()}</p>
-              <p className="text-xs text-gray-500 mt-1">Status: {selectedMatch.status || 'Scheduled'}</p>
             </div>
-
-            {/* Correct Score Prediction */}
             <div className="mb-6">
               <h3 className="text-sm font-bold text-gray-400 uppercase tracking-widest mb-3">Most Probable Scorelines</h3>
               <div className="grid grid-cols-1 gap-2">
                 {selectedMatch.topCorrectScores?.map((s, i) => (
-                  <div key={i} className="bg-gray-900 p-2 rounded text-sm flex justify-between border border-gray-700">
-                    <span className="text-gray-400">Score: <b className="text-white">{s.score}</b></span>
-                    <span className="text-emerald-400 font-bold">{s.probability}%</span>
-                  </div>
+                  <div key={i} className="bg-gray-900 p-2 rounded text-sm flex justify-between border border-gray-700"><span className="text-gray-400">Score: <b className="text-white">{s.score}</b></span><span className="text-emerald-400 font-bold">{s.probability}%</span></div>
                 ))}
               </div>
             </div>
-
-            {/* All Markets */}
             <div className="mb-6">
               <h3 className="text-sm font-bold text-gray-400 uppercase tracking-widest mb-3">All Market Probabilities</h3>
               <div className="grid grid-cols-2 gap-2">
                 {selectedMatch.allMarkets?.map((m, i) => (
-                  <div key={i} className="bg-gray-900 p-2 rounded text-xs border border-gray-700">
-                    <p className="text-gray-400">{m.market}</p>
-                    <div className="flex justify-between mt-1">
-                      <span className="text-white font-bold">{m.selection}</span>
-                      <span className="text-emerald-400">{m.probability}%</span>
-                    </div>
-                  </div>
+                  <div key={i} className="bg-gray-900 p-2 rounded text-xs border border-gray-700"><p className="text-gray-400">{m.market}</p><div className="flex justify-between mt-1"><span className="text-white font-bold">{m.selection}</span><span className="text-emerald-400">{m.probability}%</span></div></div>
                 ))}
               </div>
             </div>
-
-            {/* AI Explanation & Stats */}
             <div className="bg-blue-900/20 border border-blue-800 p-4 rounded-lg">
               <p className="text-xs text-blue-300 uppercase tracking-wider mb-1">AI Tactical Analysis</p>
               <p className="text-sm text-gray-300 italic">"{selectedMatch.aiExplanation}"</p>
-              <div className="mt-3 space-y-1 text-xs text-gray-500">
-                {selectedMatch.missingData?.map((miss, i) => <p key={i}>• {miss}</p>)}
-              </div>
             </div>
-
           </div>
         </div>
       )}
-
     </div>
   );
 }
