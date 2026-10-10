@@ -20,7 +20,7 @@ const PredictionSchema = new mongoose.Schema({
   isCorrect: { type: Boolean, default: null },
   allMarkets: Array, bestMarketString: String, topCorrectScores: Array,
   confidenceScore: String, dataQuality: String, recommendation: String, predictedScore: String,
-  aiExplanation: String, modelVersion: { type: String, default: 'v11.0 Stable Release' }
+  aiExplanation: String, modelVersion: { type: String, default: 'v12.0 Unified API-Sports' }
 });
 const Prediction = mongoose.model('Prediction', PredictionSchema);
 
@@ -180,114 +180,111 @@ class PredictionEngine {
 
 const engine = new PredictionEngine();
 
-async function getRealForm(teamId) {
-  try {
-    const res = await axios.get(`https://api.sportmonks.com/v3/football/teams/${teamId}/fixtures?api_token=${process.env.SPORTMONKS_API_KEY}&per_page=5&order=desc`);
-    return { last5: res.data.data.map(f => f.scores?.[0]?.score?.goals > f.scores?.[1]?.score?.goals ? 'W' : 'L') };
-  } catch { return null; }
-}
-
 // --- AUTOMATED 24/7 WORKER ---
 async function runDailyCycle() {
   console.log(`[$] [${new Date().toLocaleTimeString()}] Running 24/7 Cycle...`);
+  const apiKey = process.env.API_SPORTS_KEY;
+  if (!apiKey) return console.log('[!] Missing API_SPORTS_KEY in Render Environment.');
 
-  // 1. FOOTBALL
-  const footballKey = process.env.SPORTMONKS_API_KEY;
-  if (footballKey) {
-    try {
-      const today = new Date(); const nextWeek = new Date(); nextWeek.setDate(today.getDate() + 7);
-      const formatDate = (date) => date.toISOString().split('T')[0];
-      const res = await axios.get(`https://api.sportmonks.com/v3/football/fixtures/between/${formatDate(today)}/${formatDate(nextWeek)}?api_token=${footballKey}&include=participants;scores;league&per_page=1000`);
-      
-      let newPredCount = 0;
-      for (const fixture of res.data.data) {
-        const matchId = `real_${fixture.id}`;
+  const headers = { 'x-apisports-key': apiKey };
+  let newFootCount = 0, newBballCount = 0;
+
+  // Fetch Today & Tomorrow to stay under 100 req/day limit but still get upcoming matches
+  const datesToFetch = [new Date(), new Date(Date.now() + 86400000)]; 
+  const todayStr = new Date().toISOString().split('T')[0];
+  const tomStr = new Date(Date.now() + 86400000).toISOString().split('T')[0];
+
+  // 1. FOOTBALL (API-Sports v3)
+  try {
+    for (const dateStr of [todayStr, tomStr]) {
+      const res = await axios.get(`https://v3.football.api-sports.io/fixtures?date=${dateStr}`, { headers });
+      for (const game of res.data.response) {
+        const matchId = `apifoot_${game.fixture.id}`;
         const existing = await Prediction.findOne({ fixtureId: matchId });
-        const matchStatus = fixture.state || 'NS';
+        const matchStatus = game.fixture.status.short || 'NS';
 
-        if (matchStatus === 'FT' && existing && !existing.isFinished) {
-           existing.isFinished = true;
-           const homeScoreObj = fixture.scores.find(s => s.score.participant === 'home');
-           const awayScoreObj = fixture.scores.find(s => s.score.participant === 'away');
-           if (homeScoreObj && awayScoreObj) {
-             const homeScore = homeScoreObj.score.goals, awayScore = awayScoreObj.score.goals;
-             let actualWinner = 'Draw';
-             if (homeScore > awayScore) actualWinner = existing.homeTeam; else if (awayScore > homeScore) actualWinner = existing.awayTeam;
-             existing.actualScore = `${homeScore}-${awayScore}`; existing.actualWinner = actualWinner;
-             existing.isCorrect = actualWinner === existing.predictedWinner;
-             if (!existing.isCorrect) existing.errorDiagnosis = "Model overestimated output or upset occurred.";
-             await existing.save();
-             await History.create(existing.toObject());
-             await Prediction.deleteOne({ _id: existing._id });
-           }
-           continue;
+        // If Finished
+        if (matchStatus === 'FT' || matchStatus === 'AET' || matchStatus === 'PEN') {
+          if (existing && !existing.isFinished) {
+            existing.isFinished = true;
+            const homeScore = game.goals.home || 0, awayScore = game.goals.away || 0;
+            let actualWinner = 'Draw';
+            if (homeScore > awayScore) actualWinner = existing.homeTeam; else if (awayScore > homeScore) actualWinner = existing.awayTeam;
+            existing.actualScore = `${homeScore}-${awayScore}`; existing.actualWinner = actualWinner;
+            existing.isCorrect = actualWinner === existing.predictedWinner;
+            if (!existing.isCorrect) existing.errorDiagnosis = "Model overestimated output or upset occurred.";
+            await existing.save();
+            await History.create(existing.toObject());
+            await Prediction.deleteOne({ _id: existing._id });
+          }
+          continue;
         }
 
-        if (existing && (matchStatus === 'LIVE' || matchStatus === 'HT')) {
-           existing.status = 'LIVE';
-           const homeScoreObj = fixture.scores.find(s => s.score.participant === 'home');
-           const awayScoreObj = fixture.scores.find(s => s.score.participant === 'away');
-           if (homeScoreObj && awayScoreObj) existing.actualScore = `${homeScoreObj.score.goals}-${awayScoreObj.score.goals}`;
-           await existing.save();
-           continue;
+        // If Live
+        const liveStatus = ['1H', 'HT', '2H', 'ET', 'BT', 'P', 'LIVE'];
+        if (existing && liveStatus.includes(matchStatus)) {
+          existing.status = 'LIVE';
+          const homeScore = game.goals.home || 0, awayScore = game.goals.away || 0;
+          existing.actualScore = `${homeScore}-${awayScore}`;
+          await existing.save();
+          continue;
         }
 
-        if (!existing && matchStatus === 'NS') {
-          const homeData = fixture.participants?.find(p => p.meta?.location === 'home');
-          const awayData = fixture.participants?.find(p => p.meta?.location === 'away');
-          if (!homeData || !awayData) continue;
-          
-          const homeForm = await getRealForm(homeData.id);
-          const awayForm = await getRealForm(awayData.id);
-          
+        // If Scheduled
+        if (!existing && (matchStatus === 'NS' || matchStatus === 'TBD')) {
           const mockMatch = {
-            fixtureId: matchId, sport: 'football', league: fixture.league?.name || 'Unknown',
-            matchDate: fixture.starting_at,
-            homeTeam: { name: homeData.name, id: homeData.id, form: homeForm, venueRecord: { winPct: 0.6, awayWinPct: 0.3 } },
-            awayTeam: { name: awayData.name, id: awayData.id, form: awayForm, venueRecord: { winPct: 0.4, awayWinPct: 0.2 } },
-            injuries: { verified: false }, h2h: [{ winner: homeData.id }, { winner: awayData.id }, { winner: homeData.id }]
+            fixtureId: matchId, sport: 'football', league: game.league.name || 'Unknown',
+            matchDate: game.fixture.date,
+            homeTeam: { name: game.teams.home.name, id: game.teams.home.id, form: null, venueRecord: { winPct: 0.6, awayWinPct: 0.3 } },
+            awayTeam: { name: game.teams.away.name, id: game.teams.away.id, form: null, venueRecord: { winPct: 0.4, awayWinPct: 0.2 } },
+            injuries: { verified: false }, h2h: [{ winner: game.teams.home.id }, { winner: game.teams.away.id }, { winner: game.teams.home.id }]
           };
-
           const prediction = engine.analyzeMatch(mockMatch); 
-          prediction.date = fixture.starting_at; prediction.status = 'Scheduled';
+          prediction.date = game.fixture.date; prediction.status = 'Scheduled';
           await Prediction.create(prediction);
-          newPredCount++;
+          newFootCount++;
         }
       }
-      console.log(`[$] Football Cycle Complete. Generated ${newPredCount} new predictions.`);
-    } catch (err) { console.error('[X] Football API Error:', err.response?.statusText || err.message); }
-  }
+    }
+    console.log(`[$] Football Cycle Complete. Saved ${newFootCount} new matches.`);
+  } catch (err) { console.error('[X] Football API Error:', err.response?.statusText || err.message); }
 
-  // 2. BASKETBALL (Stable single-day fetch to prevent API rate limits)
-  const basketballKey = process.env.BASKETBALL_API_KEY;
-  if (basketballKey) {
-    try {
-      const todayStr = new Date().toISOString().split('T')[0];
-      const res = await axios.get(`https://v1.basketball.api-sports.io/games`, { headers: { 'x-apisports-key': basketballKey }, params: { date: todayStr } });
-      
-      let bballSavedCount = 0;
+  // 2. BASKETBALL (API-Sports v1)
+  try {
+    for (const dateStr of [todayStr, tomStr]) {
+      const res = await axios.get(`https://v1.basketball.api-sports.io/games?date=${dateStr}`, { headers });
       for (const game of res.data.response) {
-        const matchId = `real_bball_${game.id}`;
+        const matchId = `apibball_${game.id}`;
         const existing = await Prediction.findOne({ fixtureId: matchId });
         const matchStatus = game.status?.short || 'NS';
 
-        if (matchStatus === 'FT' && existing && !existing.isFinished) {
-          existing.isFinished = true;
+        if (matchStatus === 'FT') {
+          if (existing && !existing.isFinished) {
+            existing.isFinished = true;
+            const homeScore = game.scores.home.total || 0, awayScore = game.scores.away.total || 0;
+            let actualWinner = 'Draw';
+            if (homeScore > awayScore) actualWinner = existing.homeTeam; else if (awayScore > homeScore) actualWinner = existing.awayTeam;
+            existing.actualScore = `${homeScore}-${awayScore}`; existing.actualWinner = actualWinner;
+            existing.isCorrect = actualWinner === existing.predictedWinner;
+            if (!existing.isCorrect) existing.errorDiagnosis = "Upset or normal variance.";
+            await existing.save();
+            await History.create(existing.toObject());
+            await Prediction.deleteOne({ _id: existing._id });
+          }
+          continue;
+        }
+
+        const liveStatus = ['Q1', 'Q2', 'Q3', 'Q4', 'BT', 'HT', 'LIVE'];
+        if (existing && liveStatus.includes(matchStatus)) {
+          existing.status = 'LIVE';
           const homeScore = game.scores.home.total || 0, awayScore = game.scores.away.total || 0;
-          let actualWinner = 'Draw';
-          if (homeScore > awayScore) actualWinner = existing.homeTeam; else if (awayScore > homeScore) actualWinner = existing.awayTeam;
-          existing.actualScore = `${homeScore}-${awayScore}`; existing.actualWinner = actualWinner;
-          existing.isCorrect = actualWinner === existing.predictedWinner;
-          if (!existing.isCorrect) existing.errorDiagnosis = "Upset or normal variance.";
+          existing.actualScore = `${homeScore}-${awayScore}`;
           await existing.save();
-          await History.create(existing.toObject());
-          await Prediction.deleteOne({ _id: existing._id });
           continue;
         }
 
         if (!existing && matchStatus === 'NS') {
           const genBballForm = () => Array.from({length: 5}, () => ['W','L'][Math.floor(Math.random()*2)]);
-          
           const mockMatch = {
             fixtureId: matchId, sport: 'basketball', league: game.league.name || 'NBA',
             matchDate: game.date,
@@ -298,12 +295,12 @@ async function runDailyCycle() {
           const prediction = engine.analyzeMatch(mockMatch); 
           prediction.date = game.date; prediction.status = 'Scheduled';
           await Prediction.create(prediction);
-          bballSavedCount++;
+          newBballCount++;
         }
       }
-      console.log(`[$] Basketball Cycle Complete. Saved ${bballSavedCount} new matches.`);
-    } catch (err) { console.error('[X] Basketball API Error:', err.response?.statusText || err.message); }
-  }
+    }
+    console.log(`[$] Basketball Cycle Complete. Saved ${newBballCount} new matches.`);
+  } catch (err) { console.error('[X] Basketball API Error:', err.response?.statusText || err.message); }
 }
 
 // --- AUTOMATIC CLEANUP OF OLD MATCHES ---
