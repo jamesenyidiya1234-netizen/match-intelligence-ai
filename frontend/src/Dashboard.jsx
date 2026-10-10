@@ -2,11 +2,11 @@ import { useState, useEffect } from 'react';
 import axios from 'axios';
 
 export default function Dashboard({ onNavigate, pageFilter = 'all' }) {
-  const [predictions, setPredictions] = useState([]);
+    const [predictions, setPredictions] = useState([]);
   const [selectedMatch, setSelectedMatch] = useState(null);
   const [searchQuery, setSearchQuery] = useState('');
   const [currentWeekStart, setCurrentWeekStart] = useState(getMonday(new Date()));
-
+  const [lastUpdated, setLastUpdated] = useState(null); // Add this line
   useEffect(() => {
     const fetchData = async () => {
       try {
