@@ -7,11 +7,13 @@ export default function Dashboard({ onNavigate, pageFilter = 'all' }) {
   const [searchQuery, setSearchQuery] = useState('');
   const [currentWeekStart, setCurrentWeekStart] = useState(getMonday(new Date()));
   const [lastUpdated, setLastUpdated] = useState(null); // Add this line
-  useEffect(() => {
+    
+    useEffect(() => {
     const fetchData = async () => {
       try {
         const res = await axios.get('https://match-intelligence-ai.onrender.com/api/predictions');
         setPredictions(res.data.predictions);
+        setLastUpdated(new Date().toLocaleTimeString()); // Update the timestamp
       } catch (err) {
         console.error("API Error:", err);
         setPredictions([]);
@@ -19,7 +21,7 @@ export default function Dashboard({ onNavigate, pageFilter = 'all' }) {
     };
     
     fetchData();
-    const interval = setInterval(fetchData, 30000);
+    const interval = setInterval(fetchData, 30000); // Polls every 30 seconds
     return () => clearInterval(interval);
   }, []);
 
