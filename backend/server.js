@@ -20,14 +20,14 @@ const PredictionSchema = new mongoose.Schema({
   isCorrect: { type: Boolean, default: null },
   allMarkets: Array, bestMarketString: String, topCorrectScores: Array,
   confidenceScore: String, dataQuality: String, recommendation: String, predictedScore: String,
-  aiExplanation: String, modelVersion: { type: String, default: 'v9.0 Priority Fix' }
+  aiExplanation: String, modelVersion: { type: String, default: 'v10.0 Balanced Sports' }
 });
 const Prediction = mongoose.model('Prediction', PredictionSchema);
 
 const HistorySchema = new mongoose.Schema({ ...PredictionSchema.obj, errorDiagnosis: String });
 const History = mongoose.model('History', HistorySchema);
 
-// --- ELITE PREDICTION ENGINE (v9.0) ---
+// --- ELITE PREDICTION ENGINE (v10.0) ---
 class PredictionEngine {
   constructor() {
     this.footballWeights = { form: 0.20, injuries: 0.15, homeAway: 0.10, h2h: 0.10, tactics: 0.15, stats: 0.15, fatigue: 0.05, motivation: 0.05, transfers: 0.05 };
@@ -192,7 +192,7 @@ async function getRealForm(teamId) {
 async function runDailyCycle() {
   console.log(`[$] [${new Date().toLocaleTimeString()}] Running 24/7 Cycle...`);
 
-  // 1. FOOTBALL (Target: 20/day)
+  // 1. FOOTBALL (Fetches all available from API plan)
   const footballKey = process.env.SPORTMONKS_API_KEY;
   if (footballKey) {
     try {
@@ -261,7 +261,7 @@ async function runDailyCycle() {
     } catch (err) { console.error('[X] Football API Error:', err.response?.statusText || err.message); }
   }
 
-  // 2. BASKETBALL (Strictly capped at 10 per day to prioritize Football)
+  // 2. BASKETBALL (Cap removed, fetching all available for the week)
   const basketballKey = process.env.BASKETBALL_API_KEY;
   if (basketballKey) {
     try {
@@ -273,12 +273,7 @@ async function runDailyCycle() {
         allBballGames = allBballGames.concat(res.data.response);
       }
 
-      // Sort by date so we get the earliest ones first
-      allBballGames.sort((a, b) => new Date(a.date) - new Date(b.date));
-      
       let bballSavedCount = 0;
-      const bballDailyCounts = {}; // Track saves per day
-
       for (const game of allBballGames) {
         const matchId = `real_bball_${game.id}`;
         const existing = await Prediction.findOne({ fixtureId: matchId });
@@ -299,13 +294,6 @@ async function runDailyCycle() {
         }
 
         if (!existing && matchStatus === 'NS') {
-          // Check daily cap
-          const gameDate = new Date(game.date).toDateString();
-          if (!bballDailyCounts[gameDate]) bballDailyCounts[gameDate] = 0;
-          
-          // Strict Cap: Max 10 basketball matches per day
-          if (bballDailyCounts[gameDate] >= 10) continue; 
-          
           const genBballForm = () => Array.from({length: 5}, () => ['W','L'][Math.floor(Math.random()*2)]);
           
           const mockMatch = {
@@ -318,12 +306,10 @@ async function runDailyCycle() {
           const prediction = engine.analyzeMatch(mockMatch); 
           prediction.date = game.date; prediction.status = 'Scheduled';
           await Prediction.create(prediction);
-          
-          bballDailyCounts[gameDate]++;
           bballSavedCount++;
         }
       }
-      console.log(`[$] Basketball Cycle Complete. Saved ${bballSavedCount} new matches (Capped at 10/day).`);
+      console.log(`[$] Basketball Cycle Complete. Saved ${bballSavedCount} new matches.`);
     } catch (err) { console.error('[X] Basketball API Error:', err.response?.statusText || err.message); }
   }
 }
