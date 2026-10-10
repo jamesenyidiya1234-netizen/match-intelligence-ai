@@ -20,14 +20,14 @@ const PredictionSchema = new mongoose.Schema({
   isCorrect: { type: Boolean, default: null },
   allMarkets: Array, bestMarketString: String, topCorrectScores: Array,
   confidenceScore: String, dataQuality: String, recommendation: String, predictedScore: String,
-  aiExplanation: String, modelVersion: { type: String, default: 'v7.0 Football Priority' }
+  aiExplanation: String, modelVersion: { type: String, default: 'v8.0 Advanced Poisson' }
 });
 const Prediction = mongoose.model('Prediction', PredictionSchema);
 
 const HistorySchema = new mongoose.Schema({ ...PredictionSchema.obj, errorDiagnosis: String });
 const History = mongoose.model('History', HistorySchema);
 
-// --- ELITE PREDICTION ENGINE (v7.0) ---
+// --- ELITE PREDICTION ENGINE (v8.0) ---
 class PredictionEngine {
   constructor() {
     this.footballWeights = { form: 0.20, injuries: 0.15, homeAway: 0.10, h2h: 0.10, tactics: 0.15, stats: 0.15, fatigue: 0.05, motivation: 0.05, transfers: 0.05 };
@@ -58,7 +58,7 @@ class PredictionEngine {
       awayAttack = 0.9 + (aWins * 0.25) - (aLosses * 0.1); 
       awayDefense = 1.3 - (aWins * 0.1) + (aLosses * 0.2);
     } else { 
-      // FIX: Deterministic Baseline based on Team ID so every team is unique but stable!
+      // Deterministic Baseline based on Team ID so every team is mathematically unique
       homeAttack = 0.8 + ((homeTeam.id % 10) / 10); 
       homeDefense = 1.4 - ((homeTeam.id % 5) / 10);
       awayAttack = 0.8 + ((awayTeam.id % 10) / 10);
@@ -80,11 +80,19 @@ class PredictionEngine {
     homeWinProb = homeWinProb * (1 - drawProb); awayWinProb = awayWinProb * (1 - drawProb);
 
     const markets = [], correctScores = [];
+    // Poisson math requires a positive expected goal value > 0
     const homeExpGoals = Math.max(0.1, (homeAttack * awayDefense) / 1.35); 
     const awayExpGoals = Math.max(0.1, (awayAttack * homeDefense) / 1.35);
     
-    for (let h = 0; h <= 4; h++) { for (let a = 0; a <= 4; a++) { const prob = this.poissonProb(homeExpGoals, h) * this.poissonProb(awayExpGoals, a); if (prob > 0.01) correctScores.push({ score: `${h}-${a}`, probability: prob }); } }
+    // Generate Correct Score Matrix (0-0 to 4-4)
+    for (let h = 0; h <= 4; h++) { 
+      for (let a = 0; a <= 4; a++) { 
+        const prob = this.poissonProb(homeExpGoals, h) * this.poissonProb(awayExpGoals, a); 
+        if (prob > 0.01) correctScores.push({ score: `${h}-${a}`, probability: prob }); 
+      } 
+    }
     correctScores.sort((a, b) => b.probability - a.probability);
+    
     const totalExpGoals = homeExpGoals + awayExpGoals;
     const p0 = this.poissonProb(totalExpGoals, 0), p1 = this.poissonProb(totalExpGoals, 1), p2 = this.poissonProb(totalExpGoals, 2);
     markets.push({ market: 'Match Winner', selection: homeTeam.name, probability: homeWinProb });
@@ -308,6 +316,22 @@ async function runDailyCycle() {
   }
 }
 
+// --- AUTOMATIC CLEANUP OF OLD MATCHES ---
+async function cleanupOldMatches() {
+  try {
+    const threeHoursAgo = new Date(Date.now() - 3 * 60 * 60 * 1000);
+    const oldMatches = await Prediction.find({ date: { $lt: threeHoursAgo }, status: { $ne: 'LIVE' } });
+    
+    for (const match of oldMatches) {
+      await Prediction.deleteOne({ _id: match._id });
+      console.log(`[$] Cleaned up old match: ${match.homeTeam} vs ${match.awayTeam}`);
+    }
+    if (oldMatches.length > 0) console.log(`[$] Cleanup complete. Removed ${oldMatches.length} old matches.`);
+  } catch (err) {
+    console.error('[X] Cleanup Error:', err.message);
+  }
+}
+
 // --- API ROUTES ---
 app.get('/api/predictions', async (req, res) => {
   try {
@@ -392,10 +416,14 @@ async function startServer() {
       await runDailyCycle();
     } else {
       console.log('[$] DB has data. Waiting for next cron job.');
+      await cleanupOldMatches(); 
     }
 
-        // Run every 10 minutes to continuously fetch new upcoming matches
-    cron.schedule('*/10 * * * *', () => runDailyCycle());
+    // Run every 10 minutes to fetch new matches AND cleanup old ones
+    cron.schedule('*/10 * * * *', () => {
+      runDailyCycle();
+      cleanupOldMatches();
+    });
 
   } catch (err) {
     console.error('[X] Failed to connect to MongoDB or start server:', err.message);
