@@ -1,420 +1,387 @@
+'use strict';
+
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
 const cron = require('node-cron');
 const mongoose = require('mongoose');
+
 const app = express();
+app.use(express.json({ limit: '1mb' }));
+const allowedOrigins = (process.env.CORS_ORIGINS || '*').split(',').map(s => s.trim()).filter(Boolean);
+app.use(cors({ origin: allowedOrigins.includes('*') ? '*' : allowedOrigins }));
 
-app.use(cors({ origin: '*' }));
-app.use(express.json());
+const PORT = Number(process.env.PORT || 5001);
+const MONGO_URI = process.env.MONGO_URI;
+const API_SPORTS_KEY = process.env.API_SPORTS_KEY;
+const FOOTBALL_BASE = 'https://v3.football.api-sports.io';
+const BASKETBALL_BASE = 'https://v1.basketball.api-sports.io';
+const FOOTBALL_DAILY_LIMIT = Math.max(1, Number(process.env.FOOTBALL_DAILY_LIMIT || 20));
+const BASKETBALL_DAILY_LIMIT = Math.max(1, Number(process.env.BASKETBALL_DAILY_LIMIT || 10));
+const CACHE_TTL_MS = Math.max(5, Number(process.env.STATS_CACHE_MINUTES || 60)) * 60 * 1000;
+const MODEL_VERSION = 'real-form-poisson-v1.0';
 
-// --- MONGODB CONNECTION ---
-const MONGO_URI = process.env.MONGO_URI || 'mongodb://localhost:27017/matchai';
-
-// --- MONGODB SCHEMAS ---
 const PredictionSchema = new mongoose.Schema({
-  fixtureId: { type: String, unique: true, index: true },
-  sport: String, league: String, homeTeam: String, awayTeam: String, homeTeamId: Number, awayTeamId: Number,
-  date: Date, status: String, actualScore: String, predictedWinner: String, isFinished: { type: Boolean, default: false },
-  isCorrect: { type: Boolean, default: null },
-  allMarkets: Array, bestMarketString: String, topCorrectScores: Array,
-  confidenceScore: String, dataQuality: String, recommendation: String, predictedScore: String,
-  aiExplanation: String, modelVersion: { type: String, default: 'v12.0 Unified API-Sports' }
-});
-const Prediction = mongoose.model('Prediction', PredictionSchema);
+  fixtureId: { type: String, required: true, unique: true, index: true },
+  sport: { type: String, enum: ['football', 'basketball'], required: true, index: true },
+  league: String, leagueId: Number, season: mongoose.Schema.Types.Mixed,
+  homeTeam: String, awayTeam: String, homeTeamId: Number, awayTeamId: Number,
+  date: { type: Date, index: true }, status: { type: String, default: 'Scheduled', index: true },
+  predictedWinner: String, predictedScore: String, confidenceScore: { type: Number, default: 0 },
+  winnerProbabilities: mongoose.Schema.Types.Mixed, allMarkets: [mongoose.Schema.Types.Mixed],
+  bestMarketString: String, topCorrectScores: [mongoose.Schema.Types.Mixed],
+  dataQuality: { type: String, enum: ['HIGH', 'MEDIUM', 'LOW', 'INSUFFICIENT'], default: 'INSUFFICIENT' },
+  recommendation: String, aiExplanation: String, missingData: [String], modelVersion: { type: String, default: MODEL_VERSION },
+  actualScore: String, actualWinner: String, isFinished: { type: Boolean, default: false },
+  isCorrect: { type: Boolean, default: null }, errorDiagnosis: String
+}, { timestamps: true, strict: true });
 
-const HistorySchema = new mongoose.Schema({ ...PredictionSchema.obj, errorDiagnosis: String });
-const History = mongoose.model('History', HistorySchema);
+const HistorySchema = new mongoose.Schema({}, { strict: false, timestamps: true });
+const Prediction = mongoose.models.Prediction || mongoose.model('Prediction', PredictionSchema);
+const History = mongoose.models.History || mongoose.model('History', HistorySchema);
+const statsCache = new Map();
+let cycleRunning = false;
 
-// --- ELITE PREDICTION ENGINE ---
-class PredictionEngine {
-  constructor() {
-    this.footballWeights = { form: 0.20, injuries: 0.15, homeAway: 0.10, h2h: 0.10, tactics: 0.15, stats: 0.15, fatigue: 0.05, motivation: 0.05, transfers: 0.05 };
+function dateString(date = new Date()) {
+  // Use UTC consistently. Set TZ=... in the hosting environment if local-day behaviour is required.
+  return date.toISOString().slice(0, 10);
+}
+function clamp(n, min, max) { return Math.max(min, Math.min(max, n)); }
+function factorial(n) { let value = 1; for (let i = 2; i <= n; i++) value *= i; return value; }
+function poisson(lambda, goals) { return (Math.pow(lambda, goals) * Math.exp(-lambda)) / factorial(goals); }
+function pct(n) { return Number((clamp(n, 0, 1) * 100).toFixed(1)); }
+function isFootballFinished(status) { return ['FT', 'AET', 'PEN'].includes(status); }
+function isBasketballFinished(status) { return ['FT', 'AOT', 'POST'].includes(status); }
+function isLive(status, sport) {
+  const football = ['1H', 'HT', '2H', 'ET', 'BT', 'P', 'LIVE', 'INT'];
+  const basketball = ['Q1', 'Q2', 'Q3', 'Q4', 'OT', 'BT', 'HT', 'LIVE'];
+  return (sport === 'football' ? football : basketball).includes(status);
+}
+function apiClient(baseURL) {
+  return axios.create({ baseURL, timeout: 20000, headers: { 'x-apisports-key': API_SPORTS_KEY } });
+}
+const footballApi = apiClient(FOOTBALL_BASE);
+const basketballApi = apiClient(BASKETBALL_BASE);
+
+async function cached(key, loader) {
+  const current = statsCache.get(key);
+  if (current && current.expiresAt > Date.now()) return current.value;
+  const value = await loader();
+  statsCache.set(key, { value, expiresAt: Date.now() + CACHE_TTL_MS });
+  return value;
+}
+async function apiResponse(client, path, params) {
+  const response = await client.get(path, { params });
+  if (response.data?.errors && Object.keys(response.data.errors).length) {
+    throw new Error(`API-Sports error: ${JSON.stringify(response.data.errors)}`);
   }
-  factorial(n) { if (n < 0) return 0; if (n === 0) return 1; let res = 1; for (let i = 2; i <= n; i++) res *= i; return res; }
-  poissonProb(expected, actual) { return Math.pow(expected, actual) * Math.exp(-expected) / this.factorial(actual); }
-
-  analyzeMatch(matchData) {
-    if (matchData.sport === 'basketball') return this.analyzeBasketball(matchData);
-    return this.analyzeFootball(matchData);
-  }
-
-  analyzeFootball(matchData) {
-    const { sport, homeTeam, awayTeam, injuries, h2h, league, fixtureId } = matchData;
-    let homeScore = 0, awayScore = 0, missingDataPoints = [], warnings = [];
-    let homeAttack = 1.35, homeDefense = 1.15, awayAttack = 1.15, awayDefense = 1.35;
-    
-    if (homeTeam.form && awayTeam.form) {
-      homeScore += (this.calculateForm(homeTeam.form) * this.footballWeights.form);
-      awayScore += (this.calculateForm(awayTeam.form) * this.footballWeights.form);
-      const hWins = homeTeam.form.last5.filter(v => v === 'W').length; 
-      const hLosses = homeTeam.form.last5.filter(v => v === 'L').length;
-      homeAttack = 1.0 + (hWins * 0.25) - (hLosses * 0.1); 
-      homeDefense = 1.2 - (hWins * 0.1) + (hLosses * 0.2);
-      const aWins = awayTeam.form.last5.filter(v => v === 'W').length; 
-      const aLosses = awayTeam.form.last5.filter(v => v === 'L').length;
-      awayAttack = 0.9 + (aWins * 0.25) - (aLosses * 0.1); 
-      awayDefense = 1.3 - (aWins * 0.1) + (aLosses * 0.2);
-    } else { 
-      homeAttack = 0.8 + ((homeTeam.id % 10) / 10); 
-      homeDefense = 1.4 - ((homeTeam.id % 5) / 10);
-      awayAttack = 0.8 + ((awayTeam.id % 10) / 10);
-      awayDefense = 1.4 - ((awayTeam.id % 5) / 10);
-      missingDataPoints.push('Recent form unavailable. Using baseline strength model.'); 
-    }
-
-    if (injuries && injuries.verified) {
-      const homeInjuryImpact = this.calculateInjuryImpact(injuries.home); const awayInjuryImpact = this.calculateInjuryImpact(injuries.away);
-      homeScore -= (homeInjuryImpact * this.footballWeights.injuries); awayScore -= (awayInjuryImpact * this.footballWeights.injuries);
-    } else { missingDataPoints.push('Injury information unverified'); }
-
-    if (homeTeam.venueRecord && awayTeam.venueRecord) { homeScore += ((homeTeam.venueRecord.winPct - awayTeam.venueRecord.awayWinPct) * this.footballWeights.homeAway); }
-    if (h2h && h2h.length >= 3) { const h2hScore = this.calculateH2H(h2h, homeTeam.id, awayTeam.id); homeScore += (h2hScore.home * this.footballWeights.h2h); awayScore += (h2hScore.away * this.footballWeights.h2h); } else { missingDataPoints.push('Insufficient H2H history'); }
-
-    const totalScore = Math.max(homeScore + awayScore, 0.1);
-    let homeWinProb = totalScore > 0 ? (homeScore / totalScore) : 0.5; let awayWinProb = totalScore > 0 ? (awayScore / totalScore) : 0.5;
-    let drawProb = 0.28 - (Math.abs(homeWinProb - awayWinProb) * 0.2);
-    homeWinProb = homeWinProb * (1 - drawProb); awayWinProb = awayWinProb * (1 - drawProb);
-
-    const markets = [], correctScores = [];
-    const homeExpGoals = Math.max(0.1, (homeAttack * awayDefense) / 1.35); 
-    const awayExpGoals = Math.max(0.1, (awayAttack * homeDefense) / 1.35);
-    
-    for (let h = 0; h <= 4; h++) { for (let a = 0; a <= 4; a++) { const prob = this.poissonProb(homeExpGoals, h) * this.poissonProb(awayExpGoals, a); if (prob > 0.01) correctScores.push({ score: `${h}-${a}`, probability: prob }); } }
-    correctScores.sort((a, b) => b.probability - a.probability);
-    
-    const totalExpGoals = homeExpGoals + awayExpGoals;
-    const p0 = this.poissonProb(totalExpGoals, 0), p1 = this.poissonProb(totalExpGoals, 1), p2 = this.poissonProb(totalExpGoals, 2);
-    markets.push({ market: 'Match Winner', selection: homeTeam.name, probability: homeWinProb });
-    markets.push({ market: 'Match Winner', selection: 'Draw', probability: drawProb });
-    markets.push({ market: 'Match Winner', selection: awayTeam.name, probability: awayWinProb });
-    markets.push({ market: 'Double Chance', selection: `${homeTeam.name} or Draw`, probability: homeWinProb + drawProb });
-    markets.push({ market: 'Over/Under 1.5 Goals', selection: 'Over 1.5', probability: 1 - (p0 + p1) });
-    markets.push({ market: 'Over/Under 2.5 Goals', selection: 'Over 2.5', probability: 1 - (p0 + p1 + p2) });
-
-    const bestMarket = markets.length > 0 ? markets.reduce((max, m) => m.probability > max.probability ? m : max, markets[0]) : null;
-    const bestProb = bestMarket ? bestMarket.probability * 100 : 0;
-    const dataQuality = missingDataPoints.length > 2 ? 'LOW' : missingDataPoints.length > 0 ? 'MEDIUM' : 'HIGH';
-    let recommendation = (bestProb >= 70 && dataQuality !== 'LOW') ? 'HIGH-CONFIDENCE SELECTION' : 'NO STRONG PREDICTION';
-
-    return {
-      fixtureId, sport, league, homeTeam: homeTeam.name, awayTeam: awayTeam.name, homeTeamId: homeTeam.id, awayTeamId: awayTeam.id,
-      allMarkets: markets.map(m => ({...m, probability: (m.probability * 100).toFixed(1)})),
-      bestMarketString: bestMarket ? `${bestMarket.market} (${bestMarket.selection})` : 'No reliable market',
-      topCorrectScores: correctScores.slice(0, 5).map(s => ({ score: s.score, probability: (s.probability * 100).toFixed(1) })),
-      predictedWinner: homeWinProb > awayWinProb ? homeTeam.name : awayTeam.name,
-      confidenceScore: bestProb.toFixed(0), dataQuality, recommendation,
-      predictedScore: `${homeExpGoals.toFixed(0)}-${awayExpGoals.toFixed(0)}`,
-      warnings, missingData: missingDataPoints,
-      aiExplanation: `Football Analysis: ${bestMarket ? bestMarket.market + ' (' + bestMarket.selection + ')' : 'No market'} is the strongest outcome with ${bestProb.toFixed(1)}% prob.`
-    };
-  }
-
-  analyzeBasketball(matchData) {
-    const { homeTeam, awayTeam, injuries, h2h, league, fixtureId } = matchData;
-    let homeStrength = 50; let awayStrength = 50;
-    let missingDataPoints = [], warnings = [];
-
-    if (homeTeam.form && awayTeam.form) {
-      homeTeam.form.last5.forEach(res => { if (res === 'W') homeStrength += 6; if (res === 'L') homeStrength -= 4; });
-      awayTeam.form.last5.forEach(res => { if (res === 'W') awayStrength += 5; if (res === 'L') awayStrength -= 5; });
-    } else { missingDataPoints.push('Recent form data unavailable'); }
-
-    if (homeTeam.venueRecord && awayTeam.venueRecord) {
-      homeStrength += (homeTeam.venueRecord.winPct * 20); awayStrength += (awayTeam.venueRecord.awayWinPct * 15);
-    } else { missingDataPoints.push('Venue records unavailable'); }
-
-    if (injuries && injuries.verified) {
-      if (injuries.home && injuries.home.length > 0) { homeStrength -= (injuries.home.filter(p => p.isStar).length * 10); warnings.push('Home team missing key players'); }
-      if (injuries.away && injuries.away.length > 0) { awayStrength -= (injuries.away.filter(p => p.isStar).length * 10); warnings.push('Away team missing key players'); }
-    } else { missingDataPoints.push('Injury/lineup information unverified'); }
-
-    if (h2h && h2h.length >= 3) {
-      let hWins = h2h.filter(m => m.winner === homeTeam.id).length; let aWins = h2h.filter(m => m.winner === awayTeam.id).length;
-      homeStrength += (hWins * 3); awayStrength += (aWins * 3);
-    } else { missingDataPoints.push('Insufficient H2H history'); }
-
-    homeStrength = Math.max(10, homeStrength); awayStrength = Math.max(10, awayStrength);
-    const totalStrength = homeStrength + awayStrength;
-    let homeWinProb = homeStrength / totalStrength; let awayWinProb = awayStrength / totalStrength;
-
-    let homeExpPoints = 105 + (homeTeam.form?.last5?.filter(v => v === 'W').length || 0) * 4 - (homeTeam.form?.last5?.filter(v => v === 'L').length || 0) * 3;
-    let awayExpPoints = 102 + (awayTeam.form?.last5?.filter(v => v === 'W').length || 0) * 3.5 - (awayTeam.form?.last5?.filter(v => v === 'L').length || 0) * 3.5;
-    homeExpPoints = Math.round(homeExpPoints); awayExpPoints = Math.round(awayExpPoints);
-
-    const totalPointsLine = 215.5;
-    const expectedTotal = homeExpPoints + awayExpPoints;
-    const overProb = Math.min(0.95, Math.max(0.05, (expectedTotal - totalPointsLine) / 20 + 0.5));
-
-    const markets = [
-      { market: 'Match Winner', selection: homeTeam.name, probability: homeWinProb },
-      { market: 'Match Winner', selection: awayTeam.name, probability: awayWinProb },
-      { market: `Over/Under ${totalPointsLine} Points`, selection: 'Over', probability: overProb },
-      { market: `Over/Under ${totalPointsLine} Points`, selection: 'Under', probability: 1 - overProb }
-    ];
-
-    const bestMarket = markets.reduce((max, m) => m.probability > max.probability ? m : max, markets[0]);
-    const bestProb = bestMarket.probability * 100;
-    const dataQuality = missingDataPoints.length > 2 ? 'LOW' : missingDataPoints.length > 0 ? 'MEDIUM' : 'HIGH';
-    let recommendation = (bestProb >= 70 && dataQuality !== 'LOW') ? 'HIGH-CONFIDENCE SELECTION' : 'NO STRONG PREDICTION';
-
-    return {
-      fixtureId, sport: 'basketball', league, homeTeam: homeTeam.name, awayTeam: awayTeam.name, 
-      homeTeamId: homeTeam.id, awayTeamId: awayTeam.id,
-      allMarkets: markets.map(m => ({...m, probability: (m.probability * 100).toFixed(1)})),
-      bestMarketString: `${bestMarket.market} (${bestMarket.selection})`,
-      topCorrectScores: [], 
-      predictedWinner: homeWinProb > awayWinProb ? homeTeam.name : awayTeam.name,
-      confidenceScore: bestProb.toFixed(0), dataQuality, recommendation,
-      predictedScore: `${homeExpPoints}-${awayExpPoints}`,
-      warnings, missingData: missingDataPoints,
-      aiExplanation: `Basketball Analysis: ${bestMarket.selection} has a ${bestProb.toFixed(1)}% probability based on current form, home/away splits, and roster availability.`
-    };
-  }
-
-  calculateForm(form) { if (!form || !form.last5) return 0.5; return form.last5.reduce((acc, val) => acc + (val === 'W' ? 3 : val === 'D' ? 1 : 0), 0) / 15; }
-  calculateInjuryImpact(injuredPlayers) { if (!injuredPlayers) return 0; return injuredPlayers.reduce((impact, p) => impact + (p.isStar ? 0.3 : 0.1), 0); }
-  calculateH2H(matches, homeId, awayId) { if (!matches) return { home: 0.5, away: 0.5 }; let homeWins = 0, awayWins = 0; matches.forEach(m => { if (m.winner === homeId) homeWins++; else if (m.winner === awayId) awayWins++; }); return { home: homeWins / matches.length, away: awayWins / matches.length }; }
+  return Array.isArray(response.data?.response) ? response.data.response : [];
 }
 
-const engine = new PredictionEngine();
+// Only completed matches before the upcoming fixture are used. No random form, mock injuries, or mock H2H.
+async function footballRecent(teamId, beforeDate) {
+  return cached(`football:${teamId}:${dateString(new Date(beforeDate))}`, async () => {
+    const games = await apiResponse(footballApi, '/fixtures', { team: teamId, last: 10, status: 'FT' });
+    return games.filter(g => new Date(g.fixture?.date) < new Date(beforeDate) && isFootballFinished(g.fixture?.status?.short))
+      .sort((a, b) => new Date(b.fixture.date) - new Date(a.fixture.date)).slice(0, 5);
+  });
+}
+function footballTeamStats(games, teamId) {
+  let gf = 0, ga = 0, wins = 0, draws = 0, losses = 0, count = 0;
+  for (const game of games) {
+    const isHome = Number(game.teams?.home?.id) === Number(teamId);
+    const own = isHome ? game.goals?.home : game.goals?.away;
+    const against = isHome ? game.goals?.away : game.goals?.home;
+    if (!Number.isFinite(own) || !Number.isFinite(against)) continue;
+    gf += own; ga += against; count++;
+    if (own > against) wins++; else if (own === against) draws++; else losses++;
+  }
+  if (!count) return null;
+  return { played: count, goalsForPerMatch: gf / count, goalsAgainstPerMatch: ga / count, wins, draws, losses };
+}
+function normalize(values) {
+  const sum = values.reduce((a, b) => a + b, 0);
+  return sum > 0 ? values.map(v => v / sum) : values.map(() => 1 / values.length);
+}
+function footballPrediction(fixture, homeStats, awayStats) {
+  const missing = [];
+  if (!homeStats || homeStats.played < 3) missing.push('Home team has fewer than 3 usable recent results');
+  if (!awayStats || awayStats.played < 3) missing.push('Away team has fewer than 3 usable recent results');
+  const enough = homeStats?.played >= 3 && awayStats?.played >= 3;
+  const leagueHomeAvg = 1.45, leagueAwayAvg = 1.15; // conservative fallback only; never represented as observed league data
+  let homeXg, awayXg;
+  if (enough) {
+    const homeAttack = homeStats.goalsForPerMatch / leagueHomeAvg;
+    const awayDefence = awayStats.goalsAgainstPerMatch / leagueHomeAvg;
+    const awayAttack = awayStats.goalsForPerMatch / leagueAwayAvg;
+    const homeDefence = homeStats.goalsAgainstPerMatch / leagueAwayAvg;
+    homeXg = clamp(leagueHomeAvg * homeAttack * awayDefence, 0.2, 4.2);
+    awayXg = clamp(leagueAwayAvg * awayAttack * homeDefence, 0.2, 4.2);
+  } else {
+    // Fixture can still be listed, but we explicitly do not present this fallback as a betting prediction.
+    homeXg = leagueHomeAvg; awayXg = leagueAwayAvg;
+  }
+  const grid = [];
+  let pHome = 0, pDraw = 0, pAway = 0, pOver15 = 0, pOver25 = 0, pUnder25 = 0, pBtts = 0;
+  for (let h = 0; h <= 8; h++) for (let a = 0; a <= 8; a++) {
+    const p = poisson(homeXg, h) * poisson(awayXg, a);
+    grid.push({ score: `${h}-${a}`, home: h, away: a, p });
+    if (h > a) pHome += p; else if (h === a) pDraw += p; else pAway += p;
+    if (h + a >= 2) pOver15 += p;
+    if (h + a >= 3) pOver25 += p; else pUnder25 += p;
+    if (h > 0 && a > 0) pBtts += p;
+  }
+  const [homeProb, drawProb, awayProb] = normalize([pHome, pDraw, pAway]);
+  const markets = [
+    { market: 'Match Winner', selection: fixture.teams.home.name, probability: pct(homeProb) },
+    { market: 'Match Winner', selection: 'Draw', probability: pct(drawProb) },
+    { market: 'Match Winner', selection: fixture.teams.away.name, probability: pct(awayProb) },
+    { market: 'Double Chance', selection: `${fixture.teams.home.name} or Draw`, probability: pct(homeProb + drawProb) },
+    { market: 'Double Chance', selection: `${fixture.teams.away.name} or Draw`, probability: pct(awayProb + drawProb) },
+    { market: 'Goals', selection: 'Over 1.5', probability: pct(pOver15) },
+    { market: 'Goals', selection: 'Over 2.5', probability: pct(pOver25) },
+    { market: 'Goals', selection: 'Under 2.5', probability: pct(pUnder25) },
+    { market: 'Both Teams to Score', selection: 'Yes', probability: pct(pBtts) },
+    { market: 'Both Teams to Score', selection: 'No', probability: pct(1 - pBtts) }
+  ];
+  // Compare market types separately; don't let Double Chance automatically win because it has a wider outcome.
+  const winnerCandidates = markets.filter(m => m.market === 'Match Winner');
+  const winnerBest = winnerCandidates.reduce((a, b) => a.probability >= b.probability ? a : b);
+  const scoreBest = grid.slice().sort((a, b) => b.p - a.p).slice(0, 5);
+  const dataQuality = !enough ? 'INSUFFICIENT' : (homeStats.played >= 5 && awayStats.played >= 5 ? 'MEDIUM' : 'LOW');
+  const recommendation = !enough ? 'NO BET — insufficient recent data' : (winnerBest.probability >= 60 ? 'Consider only after checking lineups and odds; not a guarantee' : 'NO STRONG WINNER — high uncertainty');
+  return {
+    fixtureId: `football_${fixture.fixture.id}`, sport: 'football', league: fixture.league?.name || 'Unknown', leagueId: fixture.league?.id,
+    season: fixture.league?.season, homeTeam: fixture.teams.home.name, awayTeam: fixture.teams.away.name,
+    homeTeamId: fixture.teams.home.id, awayTeamId: fixture.teams.away.id, date: new Date(fixture.fixture.date), status: 'Scheduled',
+    predictedWinner: enough ? (winnerBest.selection === 'Draw' ? 'Draw' : winnerBest.selection) : 'No reliable prediction',
+    predictedScore: enough ? `${Math.round(homeXg)}-${Math.round(awayXg)}` : 'Not available',
+    confidenceScore: enough ? winnerBest.probability : 0,
+    winnerProbabilities: { home: pct(homeProb), draw: pct(drawProb), away: pct(awayProb) },
+    allMarkets: markets, bestMarketString: enough ? `${winnerBest.selection} (match-winner estimate ${winnerBest.probability}%)` : 'No reliable market — insufficient data',
+    topCorrectScores: enough ? scoreBest.map(s => ({ score: s.score, probability: pct(s.p) })) : [],
+    dataQuality, recommendation, missingData: missing, modelVersion: MODEL_VERSION,
+    aiExplanation: enough ? `Estimated from ${homeStats.played} recent completed home-team fixtures and ${awayStats.played} recent completed away-team fixtures. Probabilities are model estimates, not guarantees.` : 'Real fixture found, but insufficient recent completed-match data. No betting prediction is issued.'
+  };
+}
 
-// --- AUTOMATED 24/7 WORKER ---
+async function basketballRecent(teamId, season, beforeDate) {
+  if (season === undefined || season === null || season === '') return [];
+  return cached(`basketball:${teamId}:${season}:${dateString(new Date(beforeDate))}`, async () => {
+    const games = await apiResponse(basketballApi, '/games', { team: teamId, season });
+    return games.filter(g => new Date(g.date) < new Date(beforeDate) && isBasketballFinished(g.status?.short))
+      .sort((a, b) => new Date(b.date) - new Date(a.date)).slice(0, 10);
+  });
+}
+function basketballTeamStats(games, teamId) {
+  let scored = 0, conceded = 0, wins = 0, count = 0;
+  for (const g of games) {
+    const homeId = Number(g.teams?.home?.id), awayId = Number(g.teams?.away?.id);
+    const homeTotal = Number(g.scores?.home?.total), awayTotal = Number(g.scores?.away?.total);
+    if (!Number.isFinite(homeTotal) || !Number.isFinite(awayTotal)) continue;
+    const home = homeId === Number(teamId);
+    if (!home && awayId !== Number(teamId)) continue;
+    const own = home ? homeTotal : awayTotal, opp = home ? awayTotal : homeTotal;
+    scored += own; conceded += opp; if (own > opp) wins++; count++;
+  }
+  return count ? { played: count, pointsFor: scored / count, pointsAgainst: conceded / count, winRate: wins / count } : null;
+}
+function basketballPrediction(game, homeStats, awayStats) {
+  const enough = homeStats?.played >= 5 && awayStats?.played >= 5;
+  const missing = [];
+  if (!homeStats || homeStats.played < 5) missing.push('Insufficient recent completed games for home team');
+  if (!awayStats || awayStats.played < 5) missing.push('Insufficient recent completed games for away team');
+  const homePts = enough ? clamp((homeStats.pointsFor + awayStats.pointsAgainst) / 2, 60, 160) : null;
+  const awayPts = enough ? clamp((awayStats.pointsFor + homeStats.pointsAgainst) / 2, 60, 160) : null;
+  let homeProb = 0.5;
+  if (enough) {
+    const margin = homePts - awayPts;
+    homeProb = 1 / (1 + Math.exp(-margin / 12));
+    // Small form-strength adjustment based on actual win rates, capped to avoid overreacting.
+    homeProb = clamp(homeProb + clamp((homeStats.winRate - awayStats.winRate) * 0.08, -0.04, 0.04), 0.05, 0.95);
+  }
+  const awayProb = 1 - homeProb;
+  const winner = homeProb >= awayProb ? game.teams.home.name : game.teams.away.name;
+  const winnerP = Math.max(homeProb, awayProb);
+  return {
+    fixtureId: `basketball_${game.id}`, sport: 'basketball', league: game.league?.name || 'Basketball', leagueId: game.league?.id,
+    season: game.league?.season, homeTeam: game.teams.home.name, awayTeam: game.teams.away.name,
+    homeTeamId: game.teams.home.id, awayTeamId: game.teams.away.id, date: new Date(game.date), status: 'Scheduled',
+    predictedWinner: enough ? winner : 'No reliable prediction', predictedScore: enough ? `${Math.round(homePts)}-${Math.round(awayPts)}` : 'Not available',
+    confidenceScore: enough ? pct(winnerP) : 0, winnerProbabilities: { home: pct(homeProb), away: pct(awayProb) },
+    allMarkets: enough ? [
+      { market: 'Match Winner', selection: game.teams.home.name, probability: pct(homeProb) },
+      { market: 'Match Winner', selection: game.teams.away.name, probability: pct(awayProb) }
+    ] : [], bestMarketString: enough ? `${winner} (match-winner estimate ${pct(winnerP)}%)` : 'No reliable market — insufficient data',
+    topCorrectScores: [], dataQuality: enough ? 'MEDIUM' : 'INSUFFICIENT',
+    recommendation: enough && winnerP >= 0.65 ? 'Model lean only; verify lineups and odds' : 'NO STRONG WINNER — high uncertainty',
+    missingData: missing, modelVersion: MODEL_VERSION,
+    aiExplanation: enough ? `Estimated from ${homeStats.played} recent completed games for each team. Probabilities are model estimates, not guarantees.` : 'Real fixture found, but insufficient recent completed-game data. No betting prediction is issued.'
+  };
+}
+
+async function updateFinishedMatch(existing, sport, fixture) {
+  const status = sport === 'football' ? fixture.fixture?.status?.short : fixture.status?.short;
+  const finished = sport === 'football' ? isFootballFinished(status) : isBasketballFinished(status);
+  if (!finished) return false;
+  const homeScore = sport === 'football' ? fixture.goals?.home : fixture.scores?.home?.total;
+  const awayScore = sport === 'football' ? fixture.goals?.away : fixture.scores?.away?.total;
+  if (!Number.isFinite(Number(homeScore)) || !Number.isFinite(Number(awayScore))) return false;
+  const actualWinner = Number(homeScore) > Number(awayScore) ? existing.homeTeam : Number(awayScore) > Number(homeScore) ? existing.awayTeam : 'Draw';
+  existing.actualScore = `${homeScore}-${awayScore}`;
+  existing.actualWinner = actualWinner;
+  existing.isFinished = true;
+  existing.isCorrect = existing.predictedWinner !== 'No reliable prediction' && actualWinner === existing.predictedWinner;
+  existing.status = 'Finished';
+  if (existing.predictedWinner === 'No reliable prediction') existing.errorDiagnosis = 'Prediction withheld due to insufficient data';
+  else if (!existing.isCorrect) existing.errorDiagnosis = 'Model estimate did not match the final result';
+  const obj = existing.toObject();
+  delete obj._id;
+  delete obj.__v;
+  await History.updateOne({ fixtureId: existing.fixtureId }, { $set: obj }, { upsert: true });
+  await Prediction.deleteOne({ _id: existing._id });
+  return true;
+}
+
 async function runDailyCycle() {
-  console.log(`[$] [${new Date().toLocaleTimeString()}] Running 24/7 Cycle...`);
-  const apiKey = process.env.API_SPORTS_KEY;
-  if (!apiKey) return console.log('[!] Missing API_SPORTS_KEY in Render Environment.');
-
-  const headers = { 'x-apisports-key': apiKey };
-  let newFootCount = 0, newBballCount = 0;
-
-  // Fetch Today & Tomorrow to stay under 100 req/day limit but still get upcoming matches
-  const datesToFetch = [new Date(), new Date(Date.now() + 86400000)]; 
-  const todayStr = new Date().toISOString().split('T')[0];
-  const tomStr = new Date(Date.now() + 86400000).toISOString().split('T')[0];
-
-  // 1. FOOTBALL (API-Sports v3)
+  if (cycleRunning) return { skipped: true, reason: 'Cycle already running' };
+  if (!API_SPORTS_KEY) throw new Error('API_SPORTS_KEY is missing from environment variables');
+  cycleRunning = true;
+  const counts = { football: 0, basketball: 0, errors: [] };
   try {
-    for (const dateStr of [todayStr, tomStr]) {
-      const res = await axios.get(`https://v3.football.api-sports.io/fixtures?date=${dateStr}`, { headers });
-      for (const game of res.data.response) {
-        const matchId = `apifoot_${game.fixture.id}`;
-        const existing = await Prediction.findOne({ fixtureId: matchId });
-        const matchStatus = game.fixture.status.short || 'NS';
-
-        // If Finished
-        if (matchStatus === 'FT' || matchStatus === 'AET' || matchStatus === 'PEN') {
-          if (existing && !existing.isFinished) {
-            existing.isFinished = true;
-            const homeScore = game.goals.home || 0, awayScore = game.goals.away || 0;
-            let actualWinner = 'Draw';
-            if (homeScore > awayScore) actualWinner = existing.homeTeam; else if (awayScore > homeScore) actualWinner = existing.awayTeam;
-            existing.actualScore = `${homeScore}-${awayScore}`; existing.actualWinner = actualWinner;
-            existing.isCorrect = actualWinner === existing.predictedWinner;
-            if (!existing.isCorrect) existing.errorDiagnosis = "Model overestimated output or upset occurred.";
-            await existing.save();
-            await History.create(existing.toObject());
-            await Prediction.deleteOne({ _id: existing._id });
-          }
-          continue;
-        }
-
-        // If Live
-        const liveStatus = ['1H', 'HT', '2H', 'ET', 'BT', 'P', 'LIVE'];
-        if (existing && liveStatus.includes(matchStatus)) {
-          existing.status = 'LIVE';
-          const homeScore = game.goals.home || 0, awayScore = game.goals.away || 0;
-          existing.actualScore = `${homeScore}-${awayScore}`;
-          await existing.save();
-          continue;
-        }
-
-        // If Scheduled
-        if (!existing && (matchStatus === 'NS' || matchStatus === 'TBD')) {
-          const mockMatch = {
-            fixtureId: matchId, sport: 'football', league: game.league.name || 'Unknown',
-            matchDate: game.fixture.date,
-            homeTeam: { name: game.teams.home.name, id: game.teams.home.id, form: null, venueRecord: { winPct: 0.6, awayWinPct: 0.3 } },
-            awayTeam: { name: game.teams.away.name, id: game.teams.away.id, form: null, venueRecord: { winPct: 0.4, awayWinPct: 0.2 } },
-            injuries: { verified: false }, h2h: [{ winner: game.teams.home.id }, { winner: game.teams.away.id }, { winner: game.teams.home.id }]
-          };
-          const prediction = engine.analyzeMatch(mockMatch); 
-          prediction.date = game.fixture.date; prediction.status = 'Scheduled';
-          await Prediction.create(prediction);
-          newFootCount++;
-        }
-      }
+    const dates = [dateString(), dateString(new Date(Date.now() + 86400000))];
+    const footballFixtures = [];
+    for (const date of dates) {
+      try { footballFixtures.push(...await apiResponse(footballApi, '/fixtures', { date })); }
+      catch (e) { counts.errors.push(`Football fixtures ${date}: ${e.message}`); }
     }
-    console.log(`[$] Football Cycle Complete. Saved ${newFootCount} new matches.`);
-  } catch (err) { console.error('[X] Football API Error:', err.response?.statusText || err.message); }
-
-  // 2. BASKETBALL (API-Sports v1)
-  try {
-    for (const dateStr of [todayStr, tomStr]) {
-      const res = await axios.get(`https://v1.basketball.api-sports.io/games?date=${dateStr}`, { headers });
-      for (const game of res.data.response) {
-        const matchId = `apibball_${game.id}`;
-        const existing = await Prediction.findOne({ fixtureId: matchId });
-        const matchStatus = game.status?.short || 'NS';
-
-        if (matchStatus === 'FT') {
-          if (existing && !existing.isFinished) {
-            existing.isFinished = true;
-            const homeScore = game.scores.home.total || 0, awayScore = game.scores.away.total || 0;
-            let actualWinner = 'Draw';
-            if (homeScore > awayScore) actualWinner = existing.homeTeam; else if (awayScore > homeScore) actualWinner = existing.awayTeam;
-            existing.actualScore = `${homeScore}-${awayScore}`; existing.actualWinner = actualWinner;
-            existing.isCorrect = actualWinner === existing.predictedWinner;
-            if (!existing.isCorrect) existing.errorDiagnosis = "Upset or normal variance.";
-            await existing.save();
-            await History.create(existing.toObject());
-            await Prediction.deleteOne({ _id: existing._id });
-          }
-          continue;
-        }
-
-        const liveStatus = ['Q1', 'Q2', 'Q3', 'Q4', 'BT', 'HT', 'LIVE'];
-        if (existing && liveStatus.includes(matchStatus)) {
-          existing.status = 'LIVE';
-          const homeScore = game.scores.home.total || 0, awayScore = game.scores.away.total || 0;
-          existing.actualScore = `${homeScore}-${awayScore}`;
-          await existing.save();
-          continue;
-        }
-
-        if (!existing && matchStatus === 'NS') {
-          const genBballForm = () => Array.from({length: 5}, () => ['W','L'][Math.floor(Math.random()*2)]);
-          const mockMatch = {
-            fixtureId: matchId, sport: 'basketball', league: game.league.name || 'NBA',
-            matchDate: game.date,
-            homeTeam: { name: game.teams.home.name, id: game.teams.home.id, form: { last5: genBballForm() }, venueRecord: { winPct: 0.5 + Math.random()*0.4, awayWinPct: 0.2 + Math.random()*0.3 } },
-            awayTeam: { name: game.teams.away.name, id: game.teams.away.id, form: { last5: genBballForm() }, venueRecord: { winPct: 0.3 + Math.random()*0.3, awayWinPct: 0.2 + Math.random()*0.4 } },
-            injuries: { verified: false }, h2h: [{ winner: game.teams.home.id }, { winner: game.teams.away.id }, { winner: game.teams.home.id }]
-          };
-          const prediction = engine.analyzeMatch(mockMatch); 
-          prediction.date = game.date; prediction.status = 'Scheduled';
-          await Prediction.create(prediction);
-          newBballCount++;
-        }
+    footballFixtures.sort((a, b) => new Date(a.fixture.date) - new Date(b.fixture.date));
+    let acceptedFootball = 0;
+    for (const fixture of footballFixtures) {
+      const status = fixture.fixture?.status?.short;
+      const id = `football_${fixture.fixture?.id}`;
+      const existing = await Prediction.findOne({ fixtureId: id });
+      if (existing && isLive(status, 'football')) {
+        existing.status = 'LIVE'; existing.actualScore = `${fixture.goals?.home ?? 0}-${fixture.goals?.away ?? 0}`; await existing.save(); continue;
       }
+      if (existing && isFootballFinished(status)) { await updateFinishedMatch(existing, 'football', fixture); continue; }
+      if (status !== 'NS' && status !== 'TBD') continue;
+      if (existing) continue;
+      if (acceptedFootball >= FOOTBALL_DAILY_LIMIT) continue;
+      acceptedFootball++;
+      try {
+        const beforeDate = fixture.fixture.date;
+        const [hGames, aGames] = await Promise.all([
+          footballRecent(fixture.teams.home.id, beforeDate), footballRecent(fixture.teams.away.id, beforeDate)
+        ]);
+        const prediction = footballPrediction(fixture, footballTeamStats(hGames, fixture.teams.home.id), footballTeamStats(aGames, fixture.teams.away.id));
+        await Prediction.updateOne({ fixtureId: prediction.fixtureId }, { $setOnInsert: prediction }, { upsert: true });
+        counts.football++;
+      } catch (e) { counts.errors.push(`Football ${fixture.teams?.home?.name} vs ${fixture.teams?.away?.name}: ${e.message}`); }
     }
-    console.log(`[$] Basketball Cycle Complete. Saved ${newBballCount} new matches.`);
-  } catch (err) { console.error('[X] Basketball API Error:', err.response?.statusText || err.message); }
+
+    const basketballFixtures = [];
+    for (const date of dates) {
+      try { basketballFixtures.push(...await apiResponse(basketballApi, '/games', { date })); }
+      catch (e) { counts.errors.push(`Basketball fixtures ${date}: ${e.message}`); }
+    }
+    basketballFixtures.sort((a, b) => new Date(a.date) - new Date(b.date));
+    let acceptedBasketball = 0;
+    for (const game of basketballFixtures) {
+      const status = game.status?.short;
+      const id = `basketball_${game.id}`;
+      const existing = await Prediction.findOne({ fixtureId: id });
+      if (existing && isLive(status, 'basketball')) {
+        existing.status = 'LIVE'; existing.actualScore = `${game.scores?.home?.total ?? 0}-${game.scores?.away?.total ?? 0}`; await existing.save(); continue;
+      }
+      if (existing && isBasketballFinished(status)) { await updateFinishedMatch(existing, 'basketball', game); continue; }
+      if (status !== 'NS') continue;
+      if (existing) continue;
+      if (acceptedBasketball >= BASKETBALL_DAILY_LIMIT) continue;
+      acceptedBasketball++;
+      try {
+        const season = game.league?.season;
+        const [hGames, aGames] = await Promise.all([
+          basketballRecent(game.teams.home.id, season, game.date), basketballRecent(game.teams.away.id, season, game.date)
+        ]);
+        const prediction = basketballPrediction(game, basketballTeamStats(hGames, game.teams.home.id), basketballTeamStats(aGames, game.teams.away.id));
+        await Prediction.updateOne({ fixtureId: prediction.fixtureId }, { $setOnInsert: prediction }, { upsert: true });
+        counts.basketball++;
+      } catch (e) { counts.errors.push(`Basketball ${game.teams?.home?.name} vs ${game.teams?.away?.name}: ${e.message}`); }
+    }
+    console.log(`[cycle] Football added/checked: ${counts.football}; basketball added/checked: ${counts.basketball}; errors: ${counts.errors.length}`);
+    if (counts.errors.length) console.error(counts.errors.slice(0, 10).join('\n'));
+    return counts;
+  } finally { cycleRunning = false; }
 }
 
-// --- AUTOMATIC CLEANUP OF OLD MATCHES ---
-async function cleanupOldMatches() {
-  try {
-    const threeHoursAgo = new Date(Date.now() - 3 * 60 * 60 * 1000);
-    const oldMatches = await Prediction.find({ date: { $lt: threeHoursAgo }, status: { $ne: 'LIVE' } });
-    
-    for (const match of oldMatches) {
-      await Prediction.deleteOne({ _id: match._id });
-    }
-    if (oldMatches.length > 0) console.log(`[$] Cleanup complete. Removed ${oldMatches.length} old matches.`);
-  } catch (err) {
-    console.error('[X] Cleanup Error:', err.message);
-  }
-}
-
-// --- API ROUTES ---
+app.get('/health', (req, res) => res.json({ ok: true, modelVersion: MODEL_VERSION, database: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected' }));
 app.get('/api/predictions', async (req, res) => {
   try {
-    const preds = await Prediction.find().sort({ date: 1 });
-    res.json({ predictions: preds });
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to fetch predictions' });
-  }
+    const filter = {};
+    if (['football', 'basketball'].includes(req.query.sport)) filter.sport = req.query.sport;
+    const predictions = await Prediction.find(filter).sort({ date: 1 }).limit(500).lean();
+    res.json({ predictions, counts: { football: predictions.filter(p => p.sport === 'football').length, basketball: predictions.filter(p => p.sport === 'basketball').length } });
+  } catch (e) { res.status(500).json({ error: 'Failed to fetch predictions' }); }
 });
-
 app.get('/api/history', async (req, res) => {
   try {
-    const history = await History.find().sort({ _id: -1 }).limit(100);
-    const acc = history.length > 0 ? (history.filter(p => p.isCorrect).length / history.length * 100).toFixed(1) : 0;
-    res.json({ history, accuracy: acc });
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to fetch history' });
-  }
+    const history = await History.find().sort({ date: -1 }).limit(200).lean();
+    const evaluated = history.filter(p => p.predictedWinner && p.predictedWinner !== 'No reliable prediction' && typeof p.isCorrect === 'boolean');
+    res.json({ history, sampleSize: evaluated.length, accuracy: evaluated.length ? Number((evaluated.filter(p => p.isCorrect).length / evaluated.length * 100).toFixed(1)) : null });
+  } catch (e) { res.status(500).json({ error: 'Failed to fetch history' }); }
 });
-
 app.get('/api/analytics', async (req, res) => {
   try {
-    const history = await History.find();
-    if (history.length === 0) return res.json({ sampleSize: 0, accuracy: 0, brierScore: 0, calibration: [] });
-    const correct = history.filter(p => p.isCorrect).length;
-    const accuracy = (correct / history.length * 100).toFixed(1);
-    let brierSum = 0;
-    history.forEach(p => { const prob = parseFloat(p.confidenceScore) / 100; const outcome = p.isCorrect ? 1 : 0; brierSum += Math.pow(prob - outcome, 2); });
-    const brierScore = (brierSum / history.length).toFixed(3);
-    res.json({
-      sampleSize: history.length, accuracy, brierScore,
-      footballAccuracy: (history.filter(p => p.sport === 'football' && p.isCorrect).length / Math.max(1, history.filter(p => p.sport === 'football').length) * 100).toFixed(1),
-      basketballAccuracy: (history.filter(p => p.sport === 'basketball' && p.isCorrect).length / Math.max(1, history.filter(p => p.sport === 'basketball').length) * 100).toFixed(1)
-    });
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to fetch analytics' });
-  }
+    const history = await History.find().lean();
+    const evaluated = history.filter(p => p.predictedWinner && p.predictedWinner !== 'No reliable prediction' && typeof p.isCorrect === 'boolean');
+    const bySport = sport => { const list = evaluated.filter(p => p.sport === sport); return { sampleSize: list.length, accuracy: list.length ? Number((list.filter(p => p.isCorrect).length / list.length * 100).toFixed(1)) : null }; };
+    res.json({ sampleSize: evaluated.length, accuracy: evaluated.length ? Number((evaluated.filter(p => p.isCorrect).length / evaluated.length * 100).toFixed(1)) : null, football: bySport('football'), basketball: bySport('basketball'), note: 'Historical accuracy is not a promise of future performance. Only evaluated predictions are counted.' });
+  } catch (e) { res.status(500).json({ error: 'Failed to calculate analytics' }); }
+});
+app.post('/api/admin/run-cycle', async (req, res) => {
+  const expected = process.env.ADMIN_API_KEY;
+  if (!expected || req.get('x-admin-key') !== expected) return res.status(401).json({ error: 'Unauthorized' });
+  try { res.json({ ok: true, result: await runDailyCycle() }); }
+  catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// --- TELEGRAM AUTOMATION INTEGRATION ---
 async function sendTelegramPredictions() {
-  const botToken = process.env.TELEGRAM_BOT_TOKEN;
-  const chatId = '@MatchIntelligenceAI'; 
-  if (!botToken) return;
-  try {
-    const topPicks = await Prediction.find({ status: 'Scheduled' }).sort({ confidenceScore: -1 }).limit(3);
-    if (topPicks.length === 0) return;
-    let message = `⚽️ *MATCH INTELLIGENCE AI - TOP PICKS* ⚽️\n\n`;
-    topPicks.forEach((pick, index) => {
-      message += `*${index + 1}. ${pick.homeTeam} vs ${pick.awayTeam}*\n`;
-      message += `League: ${pick.league}\n`;
-      message += `Best Market: ${pick.bestMarketString} (${pick.confidenceScore}%)\n`;
-      message += `Predicted Score: ${pick.predictedScore}\n\n`;
-    });
-    message += `⚠️ Bet responsibly. Probabilities, not guarantees.`;
-    await axios.post(`https://api.telegram.org/bot${botToken}/sendMessage`, { chat_id: chatId, text: message, parse_mode: 'Markdown' });
-    console.log('[$] Sent predictions to Telegram.');
-  } catch (err) { console.error('[X] Telegram Error:', err.response?.data || err.message); }
+  const token = process.env.TELEGRAM_BOT_TOKEN;
+  const chatId = process.env.TELEGRAM_CHAT_ID;
+  if (!token || !chatId) throw new Error('TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be configured');
+  const picks = await Prediction.find({ status: 'Scheduled', recommendation: { $not: /NO BET|NO STRONG/i }, predictedWinner: { $ne: 'No reliable prediction' } })
+    .sort({ confidenceScore: -1 }).limit(3).lean();
+  if (!picks.length) return { sent: false, reason: 'No eligible predictions to send' };
+  const lines = ['⚽🏀 *MATCH INTELLIGENCE AI — MODEL PICKS*', ''];
+  picks.forEach((p, i) => {
+    lines.push(`*${i + 1}. ${p.homeTeam} vs ${p.awayTeam}*`);
+    lines.push(`Sport: ${p.sport} | League: ${p.league || 'Unknown'}`);
+    lines.push(`Model lean: ${p.predictedWinner}`);
+    lines.push(`Estimated score: ${p.predictedScore || 'Unavailable'}`);
+    lines.push(`Model estimate: ${p.confidenceScore ?? 0}%`);
+    lines.push('');
+  });
+  lines.push('⚠️ Estimates are not guarantees. Check confirmed lineups and odds; never stake money you cannot afford to lose.');
+  await axios.post(`https://api.telegram.org/bot${token}/sendMessage`, { chat_id: chatId, text: lines.join('\n'), parse_mode: 'Markdown' }, { timeout: 15000 });
+  return { sent: true, count: picks.length };
 }
-
-app.get('/api/trigger-telegram', async (req, res) => {
-  try {
-    console.log('[!] Manual Telegram trigger received.');
-    await sendTelegramPredictions();
-    res.json({ message: 'Telegram prediction trigger sent successfully! Check your channel.' });
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to send Telegram message.', details: err.message });
-  }
+app.post('/api/admin/trigger-telegram', async (req, res) => {
+  const expected = process.env.ADMIN_API_KEY;
+  if (!expected || req.get('x-admin-key') !== expected) return res.status(401).json({ error: 'Unauthorized' });
+  try { res.json({ ok: true, result: await sendTelegramPredictions() }); }
+  catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// --- START SERVER & CONNECT DB ---
-async function startServer() {
-  try {
-    await mongoose.connect(MONGO_URI);
-    console.log('[$] MongoDB Connected.');
-
-    app.listen(process.env.PORT || 5001, () => console.log(`Match Intelligence AI 24/7 Server running.`));
-
-    const count = await Prediction.countDocuments();
-    if (count === 0) {
-      console.log('[$] DB is empty. Fetching matches...');
-      await runDailyCycle();
-    } else {
-      console.log('[$] DB has data. Waiting for next cron job.');
-      await cleanupOldMatches(); 
-    }
-
-    // Run every 60 minutes to safely fetch new matches AND cleanup old ones without hitting API limits
-    cron.schedule('0 * * * *', () => {
-      runDailyCycle();
-      cleanupOldMatches();
-    });
-
-  } catch (err) {
-    console.error('[X] Failed to connect to MongoDB or start server:', err.message);
-    app.listen(process.env.PORT || 5001, () => console.log(`Server running (DB Offline).`));
-  }
+async function start() {
+  if (!MONGO_URI) throw new Error('MONGO_URI is missing. Configure MongoDB in Render environment variables.');
+  if (!API_SPORTS_KEY) throw new Error('API_SPORTS_KEY is missing. Configure your API-Sports key in Render environment variables.');
+  await mongoose.connect(MONGO_URI, { serverSelectionTimeoutMS: 15000 });
+  console.log('[startup] MongoDB connected');
+  app.listen(PORT, () => console.log(`[startup] Match AI API listening on ${PORT}`));
+  runDailyCycle().catch(e => console.error('[startup] Initial prediction cycle failed:', e.message));
+  // Refresh every 30 minutes; cached team form limits repeated statistics requests.
+  cron.schedule('*/30 * * * *', () => runDailyCycle().catch(e => console.error('[cron] cycle failed:', e.message)));
 }
-
-startServer();
+start().catch(e => { console.error('[startup] Fatal configuration/database error:', e.message); process.exit(1); });
