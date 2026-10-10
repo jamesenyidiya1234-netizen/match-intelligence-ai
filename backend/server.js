@@ -20,14 +20,14 @@ const PredictionSchema = new mongoose.Schema({
   isCorrect: { type: Boolean, default: null },
   allMarkets: Array, bestMarketString: String, topCorrectScores: Array,
   confidenceScore: String, dataQuality: String, recommendation: String, predictedScore: String,
-  aiExplanation: String, modelVersion: { type: String, default: 'v8.0 Advanced Poisson' }
+  aiExplanation: String, modelVersion: { type: String, default: 'v9.0 Priority Fix' }
 });
 const Prediction = mongoose.model('Prediction', PredictionSchema);
 
 const HistorySchema = new mongoose.Schema({ ...PredictionSchema.obj, errorDiagnosis: String });
 const History = mongoose.model('History', HistorySchema);
 
-// --- ELITE PREDICTION ENGINE (v8.0) ---
+// --- ELITE PREDICTION ENGINE (v9.0) ---
 class PredictionEngine {
   constructor() {
     this.footballWeights = { form: 0.20, injuries: 0.15, homeAway: 0.10, h2h: 0.10, tactics: 0.15, stats: 0.15, fatigue: 0.05, motivation: 0.05, transfers: 0.05 };
@@ -58,7 +58,6 @@ class PredictionEngine {
       awayAttack = 0.9 + (aWins * 0.25) - (aLosses * 0.1); 
       awayDefense = 1.3 - (aWins * 0.1) + (aLosses * 0.2);
     } else { 
-      // Deterministic Baseline based on Team ID so every team is mathematically unique
       homeAttack = 0.8 + ((homeTeam.id % 10) / 10); 
       homeDefense = 1.4 - ((homeTeam.id % 5) / 10);
       awayAttack = 0.8 + ((awayTeam.id % 10) / 10);
@@ -80,17 +79,10 @@ class PredictionEngine {
     homeWinProb = homeWinProb * (1 - drawProb); awayWinProb = awayWinProb * (1 - drawProb);
 
     const markets = [], correctScores = [];
-    // Poisson math requires a positive expected goal value > 0
     const homeExpGoals = Math.max(0.1, (homeAttack * awayDefense) / 1.35); 
     const awayExpGoals = Math.max(0.1, (awayAttack * homeDefense) / 1.35);
     
-    // Generate Correct Score Matrix (0-0 to 4-4)
-    for (let h = 0; h <= 4; h++) { 
-      for (let a = 0; a <= 4; a++) { 
-        const prob = this.poissonProb(homeExpGoals, h) * this.poissonProb(awayExpGoals, a); 
-        if (prob > 0.01) correctScores.push({ score: `${h}-${a}`, probability: prob }); 
-      } 
-    }
+    for (let h = 0; h <= 4; h++) { for (let a = 0; a <= 4; a++) { const prob = this.poissonProb(homeExpGoals, h) * this.poissonProb(awayExpGoals, a); if (prob > 0.01) correctScores.push({ score: `${h}-${a}`, probability: prob }); } }
     correctScores.sort((a, b) => b.probability - a.probability);
     
     const totalExpGoals = homeExpGoals + awayExpGoals;
@@ -200,7 +192,7 @@ async function getRealForm(teamId) {
 async function runDailyCycle() {
   console.log(`[$] [${new Date().toLocaleTimeString()}] Running 24/7 Cycle...`);
 
-  // 1. FOOTBALL (Prioritized Target: 20/day)
+  // 1. FOOTBALL (Target: 20/day)
   const footballKey = process.env.SPORTMONKS_API_KEY;
   if (footballKey) {
     try {
@@ -208,6 +200,9 @@ async function runDailyCycle() {
       const formatDate = (date) => date.toISOString().split('T')[0];
       const res = await axios.get(`https://api.sportmonks.com/v3/football/fixtures/between/${formatDate(today)}/${formatDate(nextWeek)}?api_token=${footballKey}&include=participants;scores;league&per_page=1000`);
       
+      console.log(`[$] SportMonks API returned ${res.data.data.length} total football fixtures for the next 7 days.`);
+      let newPredCount = 0;
+
       for (const fixture of res.data.data) {
         const matchId = `real_${fixture.id}`;
         const existing = await Prediction.findOne({ fixtureId: matchId });
@@ -259,13 +254,14 @@ async function runDailyCycle() {
           const prediction = engine.analyzeMatch(mockMatch); 
           prediction.date = fixture.starting_at; prediction.status = 'Scheduled';
           await Prediction.create(prediction);
+          newPredCount++;
         }
       }
-      console.log(`[$] Football Cycle Complete.`);
+      console.log(`[$] Football Cycle Complete. Generated ${newPredCount} new predictions.`);
     } catch (err) { console.error('[X] Football API Error:', err.response?.statusText || err.message); }
   }
 
-  // 2. BASKETBALL (Target: 10/day)
+  // 2. BASKETBALL (Strictly capped at 10 per day to prioritize Football)
   const basketballKey = process.env.BASKETBALL_API_KEY;
   if (basketballKey) {
     try {
@@ -276,6 +272,12 @@ async function runDailyCycle() {
         const res = await axios.get(`https://v1.basketball.api-sports.io/games`, { headers: { 'x-apisports-key': basketballKey }, params: { date: dateStr } });
         allBballGames = allBballGames.concat(res.data.response);
       }
+
+      // Sort by date so we get the earliest ones first
+      allBballGames.sort((a, b) => new Date(a.date) - new Date(b.date));
+      
+      let bballSavedCount = 0;
+      const bballDailyCounts = {}; // Track saves per day
 
       for (const game of allBballGames) {
         const matchId = `real_bball_${game.id}`;
@@ -297,6 +299,13 @@ async function runDailyCycle() {
         }
 
         if (!existing && matchStatus === 'NS') {
+          // Check daily cap
+          const gameDate = new Date(game.date).toDateString();
+          if (!bballDailyCounts[gameDate]) bballDailyCounts[gameDate] = 0;
+          
+          // Strict Cap: Max 10 basketball matches per day
+          if (bballDailyCounts[gameDate] >= 10) continue; 
+          
           const genBballForm = () => Array.from({length: 5}, () => ['W','L'][Math.floor(Math.random()*2)]);
           
           const mockMatch = {
@@ -309,9 +318,12 @@ async function runDailyCycle() {
           const prediction = engine.analyzeMatch(mockMatch); 
           prediction.date = game.date; prediction.status = 'Scheduled';
           await Prediction.create(prediction);
+          
+          bballDailyCounts[gameDate]++;
+          bballSavedCount++;
         }
       }
-      console.log(`[$] Basketball Cycle Complete.`);
+      console.log(`[$] Basketball Cycle Complete. Saved ${bballSavedCount} new matches (Capped at 10/day).`);
     } catch (err) { console.error('[X] Basketball API Error:', err.response?.statusText || err.message); }
   }
 }
