@@ -6,13 +6,11 @@ const cron = require('node-cron');
 const mongoose = require('mongoose');
 const app = express();
 
-// Explicitly allow all CORS requests
 app.use(cors({ origin: '*' }));
 app.use(express.json());
 
 // --- MONGODB CONNECTION ---
 const MONGO_URI = process.env.MONGO_URI || 'mongodb://localhost:27017/matchai';
-mongoose.connect(MONGO_URI).then(() => console.log('[$] MongoDB Connected.')).catch(err => console.error('[X] MongoDB Error:', err));
 
 // --- MONGODB SCHEMAS ---
 const PredictionSchema = new mongoose.Schema({
@@ -238,22 +236,6 @@ async function runDailyCycle() {
   }
 }
 
-// Run every 30 minutes
-cron.schedule('*/30 * * * *', () => runDailyCycle());
-
-// FIX: Always run on startup, regardless of NODE_ENV
-Prediction.countDocuments().then(count => {
-  if (count === 0) {
-    console.log('[$] DB is empty. Fetching matches...');
-    runDailyCycle();
-  } else {
-    console.log('[$] DB has data. Waiting for next cron job.');
-  }
-}).catch(err => {
-  console.error('[X] DB Error on startup:', err);
-  runDailyCycle(); // Try fetching anyway if DB check fails
-});
-
 // --- API ROUTES ---
 app.get('/api/predictions', async (req, res) => {
   try {
@@ -324,4 +306,33 @@ app.get('/api/trigger-telegram', async (req, res) => {
   }
 });
 
-app.listen(process.env.PORT || 5001, () => console.log(`Match Intelligence AI 24/7 Server running.`));
+// --- START SERVER & CONNECT DB ---
+async function startServer() {
+  try {
+    // FIX: Wait for MongoDB to connect before starting the BOT
+    await mongoose.connect(MONGO_URI);
+    console.log('[$] MongoDB Connected.');
+
+    // Start Express Server
+    app.listen(process.env.PORT || 5001, () => console.log(`Match Intelligence AI 24/7 Server running.`));
+
+    // Check if DB is empty, if so, fetch matches immediately
+    const count = await Prediction.countDocuments();
+    if (count === 0) {
+      console.log('[$] DB is empty. Fetching matches...');
+      await runDailyCycle();
+    } else {
+      console.log('[$] DB has data. Waiting for next cron job.');
+    }
+
+    // Start Cron Jobs
+    cron.schedule('*/30 * * * *', () => runDailyCycle());
+
+  } catch (err) {
+    console.error('[X] Failed to connect to MongoDB or start server:', err.message);
+    // Still start the server so frontend doesn't crash, but BOT won't work
+    app.listen(process.env.PORT || 5001, () => console.log(`Server running (DB Offline).`));
+  }
+}
+
+startServer();
