@@ -68,10 +68,13 @@ export default function Dashboard({ onNavigate, pageFilter = 'all' }) {
     dayDate.setDate(currentWeekStart.getDate() + index);
     const dateString = dayDate.toDateString();
     
+    const dayMatches = weekMatches.filter(p => new Date(p.date).toDateString() === dateString)
+                                  .sort((a,b) => new Date(a.date) - new Date(b.date));
+    
     groupedMatches[dayName] = {
       date: formatDate(dayDate),
-      matches: weekMatches.filter(p => new Date(p.date).toDateString() === dateString)
-                           .sort((a,b) => new Date(a.date) - new Date(b.date))
+      football: dayMatches.filter(p => p.sport === 'football'),
+      basketball: dayMatches.filter(p => p.sport === 'basketball')
     };
   });
 
@@ -80,6 +83,31 @@ export default function Dashboard({ onNavigate, pageFilter = 'all' }) {
     newDate.setDate(newDate.getDate() + (weeks * 7));
     setCurrentWeekStart(newDate);
   };
+
+  const renderMatchCard = (pred) => (
+    <div key={pred.fixtureId} onClick={() => setSelectedMatch(pred)} className="bg-gray-800 rounded-xl shadow-lg p-5 border border-gray-700 hover:border-emerald-500 transition-all cursor-pointer">
+      <div className="flex justify-between items-center mb-4 border-b border-gray-700 pb-3">
+        <span className="text-xs text-gray-400 font-bold">{pred.league}</span>
+        <span className={`text-xs font-bold px-2 py-1 rounded ${pred.status === 'LIVE' ? 'bg-red-900 text-red-400 animate-pulse' : pred.status === 'FT' ? 'bg-gray-700 text-gray-400' : 'bg-emerald-900 text-emerald-400'}`}>
+          {new Date(pred.date).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' })} - {pred.status || 'Scheduled'}
+        </span>
+      </div>
+      <div className="flex justify-between items-center mb-6">
+        <div className="text-left w-2/5"><p className="font-bold text-xl">{pred.homeTeam}</p><p className="text-xs text-gray-500 mt-1">Home</p></div>
+        <div className="text-center w-1/5">
+          <p className="text-xs mb-1 text-gray-400">{pred.actualScore ? 'Score' : 'Pred. Score'}</p>
+          <p className={`text-2xl font-bold px-3 py-1 rounded-lg border ${pred.actualScore ? 'bg-gray-900 border-red-700 text-red-400' : 'bg-gray-900 border-gray-700 text-white'}`}>
+            {pred.actualScore || pred.predictedScore || 'N/A'}
+          </p>
+        </div>
+        <div className="text-right w-2/5"><p className="font-bold text-xl">{pred.awayTeam}</p><p className="text-xs text-gray-500 mt-1">Away</p></div>
+      </div>
+      <div className="bg-gray-900/50 p-3 rounded-lg border border-gray-700 flex justify-between items-center">
+        <div><p className="text-xs text-gray-500 uppercase tracking-wider">Best Market</p><p className="text-sm text-white font-bold">{pred.bestMarketString || 'No reliable market'}</p></div>
+        <div className="text-right"><p className="text-xs text-gray-500 uppercase tracking-wider">Probability</p><span className="text-2xl font-mono text-emerald-400">{pred.confidenceScore || '0'}%</span></div>
+      </div>
+    </div>
+  );
 
   return (
     <div className="min-h-screen bg-gray-900 text-white">
@@ -129,38 +157,42 @@ export default function Dashboard({ onNavigate, pageFilter = 'all' }) {
         <div className="space-y-12">
           {daysOfWeek.map((dayName) => {
             const dayData = groupedMatches[dayName];
+            const showFootball = pageFilter !== 'basketball';
+            const showBasketball = pageFilter !== 'football';
+            
             return (
               <div key={dayName}>
                 <h3 className="text-xl font-semibold mb-6 border-l-4 border-emerald-500 pl-3">{dayName} — {dayData.date}</h3>
                 
-                {dayData.matches.length === 0 ? (
+                {dayData.football.length === 0 && dayData.basketball.length === 0 ? (
                   <p className="text-gray-500 text-center py-4 bg-gray-800/50 rounded-lg border border-gray-800">No matches scheduled for this day.</p>
                 ) : (
-                  <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-                    {dayData.matches.map((pred) => (
-                      <div key={pred.fixtureId} onClick={() => setSelectedMatch(pred)} className="bg-gray-800 rounded-xl shadow-lg p-5 border border-gray-700 hover:border-emerald-500 transition-all cursor-pointer">
-                        <div className="flex justify-between items-center mb-4 border-b border-gray-700 pb-3">
-                          <span className="text-xs text-gray-400 font-bold">{pred.league}</span>
-                          <span className={`text-xs font-bold px-2 py-1 rounded ${pred.status === 'LIVE' ? 'bg-red-900 text-red-400 animate-pulse' : pred.status === 'FT' ? 'bg-gray-700 text-gray-400' : 'bg-emerald-900 text-emerald-400'}`}>
-                            {new Date(pred.date).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' })} - {pred.status || 'Scheduled'}
-                          </span>
-                        </div>
-                        <div className="flex justify-between items-center mb-6">
-                          <div className="text-left w-2/5"><p className="font-bold text-xl">{pred.homeTeam}</p><p className="text-xs text-gray-500 mt-1">Home</p></div>
-                          <div className="text-center w-1/5">
-                            <p className="text-xs mb-1 text-gray-400">{pred.actualScore ? 'Score' : 'Pred. Score'}</p>
-                            <p className={`text-2xl font-bold px-3 py-1 rounded-lg border ${pred.actualScore ? 'bg-gray-900 border-red-700 text-red-400' : 'bg-gray-900 border-gray-700 text-white'}`}>
-                              {pred.actualScore || pred.predictedScore || 'N/A'}
-                            </p>
+                  <div className="space-y-8">
+                    {showFootball && (
+                      <div>
+                        <h4 className="text-sm font-bold text-gray-400 uppercase tracking-widest mb-4">FOOTBALL — TARGET: 20 MATCHES (Retrieved: {dayData.football.length}/20)</h4>
+                        {dayData.football.length === 0 ? (
+                          <p className="text-gray-500 text-sm text-center py-2 bg-gray-800/30 rounded">No football matches found for this day.</p>
+                        ) : (
+                          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                            {dayData.football.map(renderMatchCard)}
                           </div>
-                          <div className="text-right w-2/5"><p className="font-bold text-xl">{pred.awayTeam}</p><p className="text-xs text-gray-500 mt-1">Away</p></div>
-                        </div>
-                        <div className="bg-gray-900/50 p-3 rounded-lg border border-gray-700 flex justify-between items-center">
-                          <div><p className="text-xs text-gray-500 uppercase tracking-wider">Best Market</p><p className="text-sm text-white font-bold">{pred.bestMarketString || 'No reliable market'}</p></div>
-                          <div className="text-right"><p className="text-xs text-gray-500 uppercase tracking-wider">Probability</p><span className="text-2xl font-mono text-emerald-400">{pred.confidenceScore || '0'}%</span></div>
-                        </div>
+                        )}
                       </div>
-                    ))}
+                    )}
+
+                    {showBasketball && (
+                      <div>
+                        <h4 className="text-sm font-bold text-gray-400 uppercase tracking-widest mb-4">BASKETBALL — TARGET: 10 MATCHES (Retrieved: {dayData.basketball.length}/10)</h4>
+                        {dayData.basketball.length === 0 ? (
+                          <p className="text-gray-500 text-sm text-center py-2 bg-gray-800/30 rounded">No basketball matches found for this day.</p>
+                        ) : (
+                          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                            {dayData.basketball.map(renderMatchCard)}
+                          </div>
+                        )}
+                      </div>
+                    )}
                   </div>
                 )}
               </div>
