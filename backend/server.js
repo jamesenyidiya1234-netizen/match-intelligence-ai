@@ -20,14 +20,14 @@ const PredictionSchema = new mongoose.Schema({
   isCorrect: { type: Boolean, default: null },
   allMarkets: Array, bestMarketString: String, topCorrectScores: Array,
   confidenceScore: String, dataQuality: String, recommendation: String, predictedScore: String,
-  aiExplanation: String, modelVersion: { type: String, default: 'v10.0 Balanced Sports' }
+  aiExplanation: String, modelVersion: { type: String, default: 'v11.0 Stable Release' }
 });
 const Prediction = mongoose.model('Prediction', PredictionSchema);
 
 const HistorySchema = new mongoose.Schema({ ...PredictionSchema.obj, errorDiagnosis: String });
 const History = mongoose.model('History', HistorySchema);
 
-// --- ELITE PREDICTION ENGINE (v10.0) ---
+// --- ELITE PREDICTION ENGINE ---
 class PredictionEngine {
   constructor() {
     this.footballWeights = { form: 0.20, injuries: 0.15, homeAway: 0.10, h2h: 0.10, tactics: 0.15, stats: 0.15, fatigue: 0.05, motivation: 0.05, transfers: 0.05 };
@@ -43,7 +43,6 @@ class PredictionEngine {
   analyzeFootball(matchData) {
     const { sport, homeTeam, awayTeam, injuries, h2h, league, fixtureId } = matchData;
     let homeScore = 0, awayScore = 0, missingDataPoints = [], warnings = [];
-    
     let homeAttack = 1.35, homeDefense = 1.15, awayAttack = 1.15, awayDefense = 1.35;
     
     if (homeTeam.form && awayTeam.form) {
@@ -192,7 +191,7 @@ async function getRealForm(teamId) {
 async function runDailyCycle() {
   console.log(`[$] [${new Date().toLocaleTimeString()}] Running 24/7 Cycle...`);
 
-  // 1. FOOTBALL (Fetches all available from API plan)
+  // 1. FOOTBALL
   const footballKey = process.env.SPORTMONKS_API_KEY;
   if (footballKey) {
     try {
@@ -200,9 +199,7 @@ async function runDailyCycle() {
       const formatDate = (date) => date.toISOString().split('T')[0];
       const res = await axios.get(`https://api.sportmonks.com/v3/football/fixtures/between/${formatDate(today)}/${formatDate(nextWeek)}?api_token=${footballKey}&include=participants;scores;league&per_page=1000`);
       
-      console.log(`[$] SportMonks API returned ${res.data.data.length} total football fixtures for the next 7 days.`);
       let newPredCount = 0;
-
       for (const fixture of res.data.data) {
         const matchId = `real_${fixture.id}`;
         const existing = await Prediction.findOne({ fixtureId: matchId });
@@ -261,20 +258,15 @@ async function runDailyCycle() {
     } catch (err) { console.error('[X] Football API Error:', err.response?.statusText || err.message); }
   }
 
-  // 2. BASKETBALL (Cap removed, fetching all available for the week)
+  // 2. BASKETBALL (Stable single-day fetch to prevent API rate limits)
   const basketballKey = process.env.BASKETBALL_API_KEY;
   if (basketballKey) {
     try {
-      let allBballGames = [];
-      for (let i = 0; i < 7; i++) {
-        const dateObj = new Date(); dateObj.setDate(dateObj.getDate() + i);
-        const dateStr = dateObj.toISOString().split('T')[0];
-        const res = await axios.get(`https://v1.basketball.api-sports.io/games`, { headers: { 'x-apisports-key': basketballKey }, params: { date: dateStr } });
-        allBballGames = allBballGames.concat(res.data.response);
-      }
-
+      const todayStr = new Date().toISOString().split('T')[0];
+      const res = await axios.get(`https://v1.basketball.api-sports.io/games`, { headers: { 'x-apisports-key': basketballKey }, params: { date: todayStr } });
+      
       let bballSavedCount = 0;
-      for (const game of allBballGames) {
+      for (const game of res.data.response) {
         const matchId = `real_bball_${game.id}`;
         const existing = await Prediction.findOne({ fixtureId: matchId });
         const matchStatus = game.status?.short || 'NS';
@@ -322,7 +314,6 @@ async function cleanupOldMatches() {
     
     for (const match of oldMatches) {
       await Prediction.deleteOne({ _id: match._id });
-      console.log(`[$] Cleaned up old match: ${match.homeTeam} vs ${match.awayTeam}`);
     }
     if (oldMatches.length > 0) console.log(`[$] Cleanup complete. Removed ${oldMatches.length} old matches.`);
   } catch (err) {
@@ -417,8 +408,8 @@ async function startServer() {
       await cleanupOldMatches(); 
     }
 
-    // Run every 10 minutes to fetch new matches AND cleanup old ones
-    cron.schedule('*/10 * * * *', () => {
+    // Run every 60 minutes to safely fetch new matches AND cleanup old ones without hitting API limits
+    cron.schedule('0 * * * *', () => {
       runDailyCycle();
       cleanupOldMatches();
     });
