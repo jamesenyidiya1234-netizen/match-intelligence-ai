@@ -6,7 +6,8 @@ const cron = require('node-cron');
 const mongoose = require('mongoose');
 const app = express();
 
-app.use(cors());
+// Explicitly allow all CORS requests
+app.use(cors({ origin: '*' }));
 app.use(express.json());
 
 // --- MONGODB CONNECTION ---
@@ -193,7 +194,6 @@ async function runDailyCycle() {
   if (basketballKey) {
     try {
       let allBballGames = [];
-      // Loop through next 7 days to gather enough matches
       for (let i = 0; i < 7; i++) {
         const dateObj = new Date(); dateObj.setDate(dateObj.getDate() + i);
         const dateStr = dateObj.toISOString().split('T')[0];
@@ -238,36 +238,59 @@ async function runDailyCycle() {
   }
 }
 
-cron.schedule('0 * * * *', () => runDailyCycle());
-if (process.env.NODE_ENV !== 'production' || !mongoose.connection.readyState) {
-  Prediction.countDocuments().then(count => { if (count === 0) runDailyCycle(); else console.log('[$] DB has data. Skipping startup fetch.'); });
-}
+// Run every 30 minutes
+cron.schedule('*/30 * * * *', () => runDailyCycle());
+
+// FIX: Always run on startup, regardless of NODE_ENV
+Prediction.countDocuments().then(count => {
+  if (count === 0) {
+    console.log('[$] DB is empty. Fetching matches...');
+    runDailyCycle();
+  } else {
+    console.log('[$] DB has data. Waiting for next cron job.');
+  }
+}).catch(err => {
+  console.error('[X] DB Error on startup:', err);
+  runDailyCycle(); // Try fetching anyway if DB check fails
+});
 
 // --- API ROUTES ---
 app.get('/api/predictions', async (req, res) => {
-  const preds = await Prediction.find().sort({ date: 1 });
-  res.json({ predictions: preds });
+  try {
+    const preds = await Prediction.find().sort({ date: 1 });
+    res.json({ predictions: preds });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch predictions' });
+  }
 });
 
 app.get('/api/history', async (req, res) => {
-  const history = await History.find().sort({ _id: -1 }).limit(100);
-  const acc = history.length > 0 ? (history.filter(p => p.isCorrect).length / history.length * 100).toFixed(1) : 0;
-  res.json({ history, accuracy: acc });
+  try {
+    const history = await History.find().sort({ _id: -1 }).limit(100);
+    const acc = history.length > 0 ? (history.filter(p => p.isCorrect).length / history.length * 100).toFixed(1) : 0;
+    res.json({ history, accuracy: acc });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch history' });
+  }
 });
 
 app.get('/api/analytics', async (req, res) => {
-  const history = await History.find();
-  if (history.length === 0) return res.json({ sampleSize: 0, accuracy: 0, brierScore: 0, calibration: [] });
-  const correct = history.filter(p => p.isCorrect).length;
-  const accuracy = (correct / history.length * 100).toFixed(1);
-  let brierSum = 0;
-  history.forEach(p => { const prob = parseFloat(p.confidenceScore) / 100; const outcome = p.isCorrect ? 1 : 0; brierSum += Math.pow(prob - outcome, 2); });
-  const brierScore = (brierSum / history.length).toFixed(3);
-  res.json({
-    sampleSize: history.length, accuracy, brierScore,
-    footballAccuracy: (history.filter(p => p.sport === 'football' && p.isCorrect).length / Math.max(1, history.filter(p => p.sport === 'football').length) * 100).toFixed(1),
-    basketballAccuracy: (history.filter(p => p.sport === 'basketball' && p.isCorrect).length / Math.max(1, history.filter(p => p.sport === 'basketball').length) * 100).toFixed(1)
-  });
+  try {
+    const history = await History.find();
+    if (history.length === 0) return res.json({ sampleSize: 0, accuracy: 0, brierScore: 0, calibration: [] });
+    const correct = history.filter(p => p.isCorrect).length;
+    const accuracy = (correct / history.length * 100).toFixed(1);
+    let brierSum = 0;
+    history.forEach(p => { const prob = parseFloat(p.confidenceScore) / 100; const outcome = p.isCorrect ? 1 : 0; brierSum += Math.pow(prob - outcome, 2); });
+    const brierScore = (brierSum / history.length).toFixed(3);
+    res.json({
+      sampleSize: history.length, accuracy, brierScore,
+      footballAccuracy: (history.filter(p => p.sport === 'football' && p.isCorrect).length / Math.max(1, history.filter(p => p.sport === 'football').length) * 100).toFixed(1),
+      basketballAccuracy: (history.filter(p => p.sport === 'basketball' && p.isCorrect).length / Math.max(1, history.filter(p => p.sport === 'basketball').length) * 100).toFixed(1)
+    });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch analytics' });
+  }
 });
 
 // --- TELEGRAM AUTOMATION INTEGRATION ---
@@ -291,7 +314,6 @@ async function sendTelegramPredictions() {
   } catch (err) { console.error('[X] Telegram Error:', err.response?.data || err.message); }
 }
 
-// --- MANUAL TELEGRAM TRIGGER ---
 app.get('/api/trigger-telegram', async (req, res) => {
   try {
     console.log('[!] Manual Telegram trigger received.');
