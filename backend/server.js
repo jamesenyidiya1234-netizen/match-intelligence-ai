@@ -20,14 +20,14 @@ const PredictionSchema = new mongoose.Schema({
   isCorrect: { type: Boolean, default: null },
   allMarkets: Array, bestMarketString: String, topCorrectScores: Array,
   confidenceScore: String, dataQuality: String, recommendation: String, predictedScore: String,
-  aiExplanation: String, modelVersion: { type: String, default: 'v5.0 Pro' }
+  aiExplanation: String, modelVersion: { type: String, default: 'v6.0 Split Engine' }
 });
 const Prediction = mongoose.model('Prediction', PredictionSchema);
 
 const HistorySchema = new mongoose.Schema({ ...PredictionSchema.obj, errorDiagnosis: String });
 const History = mongoose.model('History', HistorySchema);
 
-// --- ELITE PREDICTION ENGINE (v5.0 Pro) ---
+// --- ELITE PREDICTION ENGINE (v6.0 Split Engine) ---
 class PredictionEngine {
   constructor() {
     this.footballWeights = { form: 0.20, injuries: 0.15, homeAway: 0.10, h2h: 0.10, tactics: 0.15, stats: 0.15, fatigue: 0.05, motivation: 0.05, transfers: 0.05 };
@@ -35,7 +35,14 @@ class PredictionEngine {
   factorial(n) { if (n < 0) return 0; if (n === 0) return 1; let res = 1; for (let i = 2; i <= n; i++) res *= i; return res; }
   poissonProb(expected, actual) { return Math.pow(expected, actual) * Math.exp(-expected) / this.factorial(actual); }
 
+  // ROUTER: Send to correct sport model
   analyzeMatch(matchData) {
+    if (matchData.sport === 'basketball') return this.analyzeBasketball(matchData);
+    return this.analyzeFootball(matchData);
+  }
+
+  // 1. FOOTBALL MODEL (Poisson Goals)
+  analyzeFootball(matchData) {
     const { sport, homeTeam, awayTeam, injuries, h2h, league, fixtureId } = matchData;
     let homeScore = 0, awayScore = 0, missingDataPoints = [], warnings = [];
     
@@ -65,27 +72,21 @@ class PredictionEngine {
 
     const totalScore = Math.max(homeScore + awayScore, 0.1);
     let homeWinProb = totalScore > 0 ? (homeScore / totalScore) : 0.5; let awayWinProb = totalScore > 0 ? (awayScore / totalScore) : 0.5;
-    let drawProb = 0;
-    if (sport === 'football') { drawProb = 0.28 - (Math.abs(homeWinProb - awayWinProb) * 0.2); homeWinProb = homeWinProb * (1 - drawProb); awayWinProb = awayWinProb * (1 - drawProb); }
+    let drawProb = 0.28 - (Math.abs(homeWinProb - awayWinProb) * 0.2);
+    homeWinProb = homeWinProb * (1 - drawProb); awayWinProb = awayWinProb * (1 - drawProb);
 
-    const markets = [], correctScores = []; let homeExpGoals = 0, awayExpGoals = 0;
-
-    if (sport === 'football') {
-      homeExpGoals = (homeAttack * awayDefense) / 1.35; awayExpGoals = (awayAttack * homeDefense) / 1.35;
-      for (let h = 0; h <= 4; h++) { for (let a = 0; a <= 4; a++) { const prob = this.poissonProb(homeExpGoals, h) * this.poissonProb(awayExpGoals, a); if (prob > 0.01) correctScores.push({ score: `${h}-${a}`, probability: prob }); } }
-      correctScores.sort((a, b) => b.probability - a.probability);
-      const totalExpGoals = homeExpGoals + awayExpGoals;
-      const p0 = this.poissonProb(totalExpGoals, 0), p1 = this.poissonProb(totalExpGoals, 1), p2 = this.poissonProb(totalExpGoals, 2);
-      markets.push({ market: 'Match Winner', selection: homeTeam.name, probability: homeWinProb });
-      markets.push({ market: 'Match Winner', selection: 'Draw', probability: drawProb });
-      markets.push({ market: 'Match Winner', selection: awayTeam.name, probability: awayWinProb });
-      markets.push({ market: 'Double Chance', selection: `${homeTeam.name} or Draw`, probability: homeWinProb + drawProb });
-      markets.push({ market: 'Over/Under 1.5 Goals', selection: 'Over 1.5', probability: 1 - (p0 + p1) });
-      markets.push({ market: 'Over/Under 2.5 Goals', selection: 'Over 2.5', probability: 1 - (p0 + p1 + p2) });
-    } else if (sport === 'basketball') {
-      markets.push({ market: 'Match Winner', selection: homeTeam.name, probability: homeWinProb });
-      markets.push({ market: 'Match Winner', selection: awayTeam.name, probability: awayWinProb });
-    }
+    const markets = [], correctScores = [];
+    const homeExpGoals = (homeAttack * awayDefense) / 1.35; const awayExpGoals = (awayAttack * homeDefense) / 1.35;
+    for (let h = 0; h <= 4; h++) { for (let a = 0; a <= 4; a++) { const prob = this.poissonProb(homeExpGoals, h) * this.poissonProb(awayExpGoals, a); if (prob > 0.01) correctScores.push({ score: `${h}-${a}`, probability: prob }); } }
+    correctScores.sort((a, b) => b.probability - a.probability);
+    const totalExpGoals = homeExpGoals + awayExpGoals;
+    const p0 = this.poissonProb(totalExpGoals, 0), p1 = this.poissonProb(totalExpGoals, 1), p2 = this.poissonProb(totalExpGoals, 2);
+    markets.push({ market: 'Match Winner', selection: homeTeam.name, probability: homeWinProb });
+    markets.push({ market: 'Match Winner', selection: 'Draw', probability: drawProb });
+    markets.push({ market: 'Match Winner', selection: awayTeam.name, probability: awayWinProb });
+    markets.push({ market: 'Double Chance', selection: `${homeTeam.name} or Draw`, probability: homeWinProb + drawProb });
+    markets.push({ market: 'Over/Under 1.5 Goals', selection: 'Over 1.5', probability: 1 - (p0 + p1) });
+    markets.push({ market: 'Over/Under 2.5 Goals', selection: 'Over 2.5', probability: 1 - (p0 + p1 + p2) });
 
     const bestMarket = markets.length > 0 ? markets.reduce((max, m) => m.probability > max.probability ? m : max, markets[0]) : null;
     const bestProb = bestMarket ? bestMarket.probability * 100 : 0;
@@ -99,11 +100,103 @@ class PredictionEngine {
       topCorrectScores: correctScores.slice(0, 5).map(s => ({ score: s.score, probability: (s.probability * 100).toFixed(1) })),
       predictedWinner: homeWinProb > awayWinProb ? homeTeam.name : awayTeam.name,
       confidenceScore: bestProb.toFixed(0), dataQuality, recommendation,
-      predictedScore: sport === 'football' ? `${homeExpGoals.toFixed(0)}-${awayExpGoals.toFixed(0)}` : 'N/A',
+      predictedScore: `${homeExpGoals.toFixed(0)}-${awayExpGoals.toFixed(0)}`,
       warnings, missingData: missingDataPoints,
-      aiExplanation: `Elite Analysis: ${bestMarket ? bestMarket.market + ' (' + bestMarket.selection + ')' : 'No market'} is the strongest outcome with ${bestProb.toFixed(1)}% prob.`
+      aiExplanation: `Football Analysis: ${bestMarket ? bestMarket.market + ' (' + bestMarket.selection + ')' : 'No market'} is the strongest outcome with ${bestProb.toFixed(1)}% prob.`
     };
   }
+
+  // 2. BASKETBALL MODEL (Strength & Efficiency Ratings)
+  analyzeBasketball(matchData) {
+    const { homeTeam, awayTeam, injuries, h2h, league, fixtureId } = matchData;
+    let homeStrength = 50; // Base rating
+    let awayStrength = 50;
+    let missingDataPoints = [], warnings = [];
+
+    // 1. Current Form (Last 5 games)
+    if (homeTeam.form && awayTeam.form) {
+      homeTeam.form.last5.forEach(res => {
+        if (res === 'W') homeStrength += 6; // +6 for a win
+        if (res === 'L') homeStrength -= 4; // -4 for a loss
+      });
+      awayTeam.form.last5.forEach(res => {
+        if (res === 'W') awayStrength += 5; // +5 for away win (harder to do)
+        if (res === 'L') awayStrength -= 5;
+      });
+    } else { missingDataPoints.push('Recent form data unavailable'); }
+
+    // 2. Home Court Advantage & Away Performance
+    if (homeTeam.venueRecord && awayTeam.venueRecord) {
+      homeStrength += (homeTeam.venueRecord.winPct * 20); // Up to +20 for strong home record
+      awayStrength += (awayTeam.venueRecord.awayWinPct * 15); // Up to +15 for away record
+    } else { missingDataPoints.push('Venue records unavailable'); }
+
+    // 3. Roster Availability (Injuries, Suspensions, New Signings integration)
+    if (injuries && injuries.verified) {
+      if (injuries.home && injuries.home.length > 0) {
+        homeStrength -= (injuries.home.filter(p => p.isStar).length * 10); // -10 for each star out
+        warnings.push('Home team missing key players');
+      }
+      if (injuries.away && injuries.away.length > 0) {
+        awayStrength -= (injuries.away.filter(p => p.isStar).length * 10);
+        warnings.push('Away team missing key players');
+      }
+    } else { missingDataPoints.push('Injury/lineup information unverified'); }
+
+    // 4. Head-to-Head (Psychological edge)
+    if (h2h && h2h.length >= 3) {
+      let hWins = h2h.filter(m => m.winner === homeTeam.id).length;
+      let aWins = h2h.filter(m => m.winner === awayTeam.id).length;
+      homeStrength += (hWins * 3); awayStrength += (aWins * 3);
+    } else { missingDataPoints.push('Insufficient H2H history'); }
+
+    // Ensure strengths don't go negative
+    homeStrength = Math.max(10, homeStrength);
+    awayStrength = Math.max(10, awayStrength);
+
+    // Calculate Win Probability
+    const totalStrength = homeStrength + awayStrength;
+    let homeWinProb = homeStrength / totalStrength;
+    let awayWinProb = awayStrength / totalStrength;
+
+    // Expected Points (Baseline 105, adjusted by form)
+    let homeExpPoints = 105 + (homeTeam.form?.last5?.filter(v => v === 'W').length || 0) * 4 - (homeTeam.form?.last5?.filter(v => v === 'L').length || 0) * 3;
+    let awayExpPoints = 102 + (awayTeam.form?.last5?.filter(v => v === 'W').length || 0) * 3.5 - (awayTeam.form?.last5?.filter(v => v === 'L').length || 0) * 3.5;
+    
+    homeExpPoints = Math.round(homeExpPoints);
+    awayExpPoints = Math.round(awayExpPoints);
+
+    // Total Points Market (Line 215.5)
+    const totalPointsLine = 215.5;
+    const expectedTotal = homeExpPoints + awayExpPoints;
+    const overProb = Math.min(0.95, Math.max(0.05, (expectedTotal - totalPointsLine) / 20 + 0.5));
+
+    const markets = [
+      { market: 'Match Winner', selection: homeTeam.name, probability: homeWinProb },
+      { market: 'Match Winner', selection: awayTeam.name, probability: awayWinProb },
+      { market: `Over/Under ${totalPointsLine} Points`, selection: 'Over', probability: overProb },
+      { market: `Over/Under ${totalPointsLine} Points`, selection: 'Under', probability: 1 - overProb }
+    ];
+
+    const bestMarket = markets.reduce((max, m) => m.probability > max.probability ? m : max, markets[0]);
+    const bestProb = bestMarket.probability * 100;
+    const dataQuality = missingDataPoints.length > 2 ? 'LOW' : missingDataPoints.length > 0 ? 'MEDIUM' : 'HIGH';
+    let recommendation = (bestProb >= 70 && dataQuality !== 'LOW') ? 'HIGH-CONFIDENCE SELECTION' : 'NO STRONG PREDICTION';
+
+    return {
+      fixtureId, sport: 'basketball', league, homeTeam: homeTeam.name, awayTeam: awayTeam.name, 
+      homeTeamId: homeTeam.id, awayTeamId: awayTeam.id,
+      allMarkets: markets.map(m => ({...m, probability: (m.probability * 100).toFixed(1)})),
+      bestMarketString: `${bestMarket.market} (${bestMarket.selection})`,
+      topCorrectScores: [], // Not used for basketball
+      predictedWinner: homeWinProb > awayWinProb ? homeTeam.name : awayTeam.name,
+      confidenceScore: bestProb.toFixed(0), dataQuality, recommendation,
+      predictedScore: `${homeExpPoints}-${awayExpPoints}`,
+      warnings, missingData: missingDataPoints,
+      aiExplanation: `Basketball Analysis: ${bestMarket.selection} has a ${bestProb.toFixed(1)}% probability based on current form, home/away splits, and roster availability.`
+    };
+  }
+
   calculateForm(form) { if (!form || !form.last5) return 0.5; return form.last5.reduce((acc, val) => acc + (val === 'W' ? 3 : val === 'D' ? 1 : 0), 0) / 15; }
   calculateInjuryImpact(injuredPlayers) { if (!injuredPlayers) return 0; return injuredPlayers.reduce((impact, p) => impact + (p.isStar ? 0.3 : 0.1), 0); }
   calculateH2H(matches, homeId, awayId) { if (!matches) return { home: 0.5, away: 0.5 }; let homeWins = 0, awayWins = 0; matches.forEach(m => { if (m.winner === homeId) homeWins++; else if (m.winner === awayId) awayWins++; }); return { home: homeWins / matches.length, away: awayWins / matches.length }; }
@@ -178,7 +271,7 @@ async function runDailyCycle() {
             injuries: { verified: false }, h2h: [{ winner: homeData.id }, { winner: awayData.id }, { winner: homeData.id }]
           };
 
-          const prediction = engine.analyzeMatch(mockMatch);
+          const prediction = engine.analyzeMatch(mockMatch); // Automatically uses Football model
           prediction.date = fixture.starting_at; prediction.status = 'Scheduled';
           await Prediction.create(prediction);
         }
@@ -219,14 +312,15 @@ async function runDailyCycle() {
         }
 
         if (!existing && matchStatus === 'NS') {
+          // Use real team IDs so H2H logic works properly in the engine
           const mockMatch = {
             fixtureId: matchId, sport: 'basketball', league: game.league.name || 'NBA',
             matchDate: game.date,
-            homeTeam: { name: game.teams.home.name, id: 1, form: { last5: ['W','L','W','W','L'] }, venueRecord: { winPct: 0.75, awayWinPct: 0.25 } },
-            awayTeam: { name: game.teams.away.name, id: 2, form: { last5: ['L','W','L','W','L'] }, venueRecord: { winPct: 0.5, awayWinPct: 0.4 } },
-            injuries: { verified: false }, h2h: [{ winner: 1 }, { winner: 2 }, { winner: 1 }]
+            homeTeam: { name: game.teams.home.name, id: game.teams.home.id, form: { last5: ['W','L','W','W','L'] }, venueRecord: { winPct: 0.75, awayWinPct: 0.25 } },
+            awayTeam: { name: game.teams.away.name, id: game.teams.away.id, form: { last5: ['L','W','L','W','L'] }, venueRecord: { winPct: 0.5, awayWinPct: 0.4 } },
+            injuries: { verified: false }, h2h: [{ winner: game.teams.home.id }, { winner: game.teams.away.id }, { winner: game.teams.home.id }]
           };
-          const prediction = engine.analyzeMatch(mockMatch);
+          const prediction = engine.analyzeMatch(mockMatch); // Automatically uses Basketball model
           prediction.date = game.date; prediction.status = 'Scheduled';
           await Prediction.create(prediction);
         }
@@ -309,14 +403,11 @@ app.get('/api/trigger-telegram', async (req, res) => {
 // --- START SERVER & CONNECT DB ---
 async function startServer() {
   try {
-    // FIX: Wait for MongoDB to connect before starting the BOT
     await mongoose.connect(MONGO_URI);
     console.log('[$] MongoDB Connected.');
 
-    // Start Express Server
     app.listen(process.env.PORT || 5001, () => console.log(`Match Intelligence AI 24/7 Server running.`));
 
-    // Check if DB is empty, if so, fetch matches immediately
     const count = await Prediction.countDocuments();
     if (count === 0) {
       console.log('[$] DB is empty. Fetching matches...');
@@ -325,12 +416,10 @@ async function startServer() {
       console.log('[$] DB has data. Waiting for next cron job.');
     }
 
-    // Start Cron Jobs
     cron.schedule('*/30 * * * *', () => runDailyCycle());
 
   } catch (err) {
     console.error('[X] Failed to connect to MongoDB or start server:', err.message);
-    // Still start the server so frontend doesn't crash, but BOT won't work
     app.listen(process.env.PORT || 5001, () => console.log(`Server running (DB Offline).`));
   }
 }
