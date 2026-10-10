@@ -394,7 +394,8 @@ async function startServer() {
       console.log('[$] DB has data. Waiting for next cron job.');
     }
 
-    cron.schedule('*/30 * * * *', () => runDailyCycle());
+        // Run every 10 minutes to continuously fetch new upcoming matches
+    cron.schedule('*/10 * * * *', () => runDailyCycle());
 
   } catch (err) {
     console.error('[X] Failed to connect to MongoDB or start server:', err.message);
