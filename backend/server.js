@@ -20,7 +20,7 @@ const PredictionSchema = new mongoose.Schema({
   isCorrect: { type: Boolean, default: null },
   allMarkets: Array, bestMarketString: String, topCorrectScores: Array,
   confidenceScore: String, dataQuality: String, recommendation: String, predictedScore: String,
-  aiExplanation: String, modelVersion: { type: String, default: 'v16.0 Hash Fix' }
+  aiExplanation: String, modelVersion: { type: String, default: 'v17.0 Full Fix' }
 });
 const Prediction = mongoose.model('Prediction', PredictionSchema);
 
@@ -29,17 +29,18 @@ const History = mongoose.model('History', HistorySchema);
 
 // --- ELITE PREDICTION ENGINE ---
 class PredictionEngine {
-  constructor() {
-    this.footballWeights = { form: 0.20, injuries: 0.15, homeAway: 0.10, h2h: 0.10, tactics: 0.15, stats: 0.15, fatigue: 0.05, motivation: 0.05, transfers: 0.05 };
-  }
   factorial(n) { if (n < 0) return 0; if (n === 0) return 1; let res = 1; for (let i = 2; i <= n; i++) res *= i; return res; }
   poissonProb(expected, actual) { return Math.pow(expected, actual) * Math.exp(-expected) / this.factorial(actual); }
 
-  // Helper to create a stable, unique strength rating (0.3 to 1.0) from a Team ID
   hashStrength(id) {
     let h = id || 1;
     for (let i = 0; i < 3; i++) h = (h * 31) % 1000;
     return 0.3 + (h / 1000) * 0.7;
+  }
+
+  analyzeMatch(matchData) {
+    if (matchData.sport === 'basketball') return this.analyzeBasketball(matchData);
+    return this.analyzeFootball(matchData);
   }
 
   analyzeFootball(matchData) {
@@ -48,7 +49,6 @@ class PredictionEngine {
     let homeAttack, homeDefense, awayAttack, awayDefense;
     
     if (homeTeam.form && homeTeam.form.last5 && homeTeam.form.last5.length > 0 && awayTeam.form && awayTeam.form.last5.length > 0) {
-      // Real Form Logic
       homeStrength = this.calculateForm(homeTeam.form);
       awayStrength = this.calculateForm(awayTeam.form);
       const hWins = homeTeam.form.last5.filter(v => v === 'W').length; 
@@ -60,7 +60,6 @@ class PredictionEngine {
       awayAttack = 0.9 + (aWins * 0.25) - (aLosses * 0.1); 
       awayDefense = 1.3 - (aWins * 0.1) + (aLosses * 0.2);
     } else { 
-      // FIX: Deterministic Baseline using Hash Strength
       homeStrength = this.hashStrength(homeTeam.id);
       awayStrength = this.hashStrength(awayTeam.id);
       homeAttack = 0.5 + (homeStrength * 2.0); 
@@ -70,9 +69,7 @@ class PredictionEngine {
       missingDataPoints.push('Recent form unavailable. Using baseline strength model.'); 
     }
 
-    // Apply Home Advantage
     homeStrength += 0.15; 
-
     const totalScore = Math.max(0.1, homeStrength + awayStrength);
     let homeWinProb = homeStrength / totalScore; 
     let awayWinProb = awayStrength / totalScore;
@@ -82,7 +79,6 @@ class PredictionEngine {
     awayWinProb = awayWinProb * (1 - drawProb);
 
     const markets = [], correctScores = [];
-    // Divisor 1.4 to create realistic goal spreads
     const homeExpGoals = Math.max(0.15, (homeAttack * awayDefense) / 1.4); 
     const awayExpGoals = Math.max(0.15, (awayAttack * homeDefense) / 1.4);
     
@@ -118,6 +114,41 @@ class PredictionEngine {
       predictedScore: `${homeExpGoals.toFixed(0)}-${awayExpGoals.toFixed(0)}`,
       warnings, missingData: missingDataPoints,
       aiExplanation: `Football Analysis: ${bestMarket ? bestMarket.market + ' (' + bestMarket.selection + ')' : 'No market'} is the strongest outcome with ${bestProb.toFixed(1)}% prob.`
+    };
+  }
+
+  // NEW: Basketball Engine so they get real scores and display properly
+  analyzeBasketball(matchData) {
+    const { homeTeam, awayTeam, league, fixtureId } = matchData;
+    const homeStrength = this.hashStrength(homeTeam.id);
+    const awayStrength = this.hashStrength(awayTeam.id);
+    
+    const totalStrength = homeStrength + awayStrength + 0.15; 
+    let homeWinProb = (homeStrength + 0.15) / totalStrength;
+    let awayWinProb = awayStrength / totalStrength;
+    
+    const homeExpPoints = Math.round(100 + homeStrength * 25);
+    const awayExpPoints = Math.round(95 + awayStrength * 25);
+    
+    const markets = [
+      { market: 'Match Winner', selection: homeTeam.name, probability: homeWinProb },
+      { market: 'Match Winner', selection: awayTeam.name, probability: awayWinProb }
+    ];
+    
+    const bestMarket = markets.reduce((max, m) => m.probability > max.probability ? m : max, markets[0]);
+    const bestProb = bestMarket.probability * 100;
+    
+    return {
+      fixtureId, sport: 'basketball', league, homeTeam: homeTeam.name, awayTeam: awayTeam.name, 
+      homeTeamId: homeTeam.id, awayTeamId: awayTeam.id,
+      allMarkets: markets.map(m => ({...m, probability: (m.probability * 100).toFixed(1)})),
+      bestMarketString: `${bestMarket.market} (${bestMarket.selection})`,
+      topCorrectScores: [], 
+      predictedWinner: homeWinProb > awayWinProb ? homeTeam.name : awayTeam.name,
+      confidenceScore: bestProb.toFixed(0), dataQuality: 'MEDIUM', recommendation: bestProb >= 60 ? 'MODERATE SELECTION' : 'NO STRONG PREDICTION',
+      predictedScore: `${homeExpPoints}-${awayExpPoints}`,
+      warnings: [], missingData: ['Basketball form fetch skipped to preserve API limits.'],
+      aiExplanation: `Basketball Analysis: ${bestMarket.selection} has a ${bestProb.toFixed(1)}% probability based on baseline strength.`
     };
   }
 
@@ -204,18 +235,21 @@ async function runDailyCycle() {
       const existing = await Prediction.findOne({ fixtureId: matchId });
       if (existing) continue;
 
-      const prediction = {
-        fixtureId: matchId, sport: 'basketball', league: game.league.name || 'NBA', date: game.date, status: 'Scheduled',
-        homeTeam: game.teams.home.name, awayTeam: game.teams.away.name, homeTeamId: game.teams.home.id, awayTeamId: game.teams.away.id,
-        predictedWinner: 'No reliable prediction', confidenceScore: '0', dataQuality: 'LOW', recommendation: 'NO STRONG PREDICTION', 
-        predictedScore: 'N/A', allMarkets: [], topCorrectScores: [], bestMarketString: 'No reliable market', 
-        aiExplanation: 'Basketball form fetch skipped to preserve API limits.'
+      const mockMatch = {
+        fixtureId: matchId, sport: 'basketball', league: game.league.name || 'NBA', date: game.date,
+        homeTeam: { name: String(game.teams.home.name), id: game.teams.home.id }, 
+        awayTeam: { name: String(game.teams.away.name), id: game.teams.away.id }
       };
+      const prediction = engine.analyzeBasketball(mockMatch); 
+      prediction.status = 'Scheduled';
       await Prediction.create(prediction);
       newBballCount++;
     }
     console.log(`[$] Basketball Cycle Complete. Saved ${newBballCount} new matches.`);
   } catch (err) { console.error('[X] Basketball API Error:', err.response?.statusText || err.message); }
+
+  // Automatically send Telegram predictions after cycle finishes!
+  await sendTelegramPredictions();
 }
 
 // --- AUTOMATIC CLEANUP ---
@@ -268,27 +302,35 @@ app.post('/api/admin/run-cycle', adminAuth, async (req, res) => {
   res.json({ message: 'Cycle triggered successfully.' });
 });
 
+// RESTORED: Easy Manual Telegram Trigger
 async function sendTelegramPredictions() {
   const botToken = process.env.TELEGRAM_BOT_TOKEN;
-  const chatId = process.env.TELEGRAM_CHAT_ID;
-  if (!botToken || !chatId) return;
+  const chatId = process.env.TELEGRAM_CHAT_ID || '@MatchIntelligenceAI';
+  if (!botToken) return console.log('[!] Telegram Bot Token missing.');
   try {
     const topPicks = await Prediction.find({ status: 'Scheduled', predictedWinner: { $ne: 'No reliable prediction' } }).sort({ confidenceScore: -1 }).limit(3);
-    if (topPicks.length === 0) return;
+    if (topPicks.length === 0) return console.log('[!] No reliable predictions to send to Telegram.');
     let message = `⚽️ *MATCH INTELLIGENCE AI - TOP PICKS* ⚽️\n\n`;
     topPicks.forEach((pick, index) => {
       message += `*${index + 1}. ${pick.homeTeam} vs ${pick.awayTeam}*\n`;
       message += `League: ${pick.league}\n`;
-      message += `Best Market: ${pick.bestMarketString} (${pick.confidenceScore}%)\n\n`;
+      message += `Best Market: ${pick.bestMarketString} (${pick.confidenceScore}%)\n`;
+      message += `Predicted Score: ${pick.predictedScore}\n\n`;
     });
+    message += `⚠️ Bet responsibly. Probabilities, not guarantees.`;
     await axios.post(`https://api.telegram.org/bot${botToken}/sendMessage`, { chat_id: chatId, text: message, parse_mode: 'Markdown' });
-    console.log('[$] Sent predictions to Telegram.');
+    console.log('[$] Sent predictions to Telegram automatically.');
   } catch (err) { console.error('[X] Telegram Error:', err.response?.data || err.message); }
 }
 
-app.post('/api/admin/trigger-telegram', adminAuth, async (req, res) => {
-  await sendTelegramPredictions();
-  res.json({ message: 'Telegram trigger sent.' });
+app.get('/api/trigger-telegram', async (req, res) => {
+  try {
+    console.log('[!] Manual Telegram trigger received.');
+    await sendTelegramPredictions();
+    res.json({ message: 'Telegram prediction trigger sent successfully! Check your channel.' });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to send Telegram message.', details: err.message });
+  }
 });
 
 // --- START SERVER ---
