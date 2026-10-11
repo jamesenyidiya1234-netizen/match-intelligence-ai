@@ -344,7 +344,11 @@ async function startServer() {
     if (count === 0) await runDailyCycle();
     else await cleanupOldMatches();
 
-    cron.schedule('0 * * * *', () => { runDailyCycle(); cleanupOldMatches(); });
+     // Run every 10 minutes to fetch new matches AND clean up old ones
+    cron.schedule('*/10 * * * *', () => {
+      runDailyCycle();
+      cleanupOldMatches();
+    });
   } catch (err) {
     console.error('[X] Failed to start:', err.message);
     app.listen(process.env.PORT || 5001, () => console.log(`Server running (DB Offline).`));
