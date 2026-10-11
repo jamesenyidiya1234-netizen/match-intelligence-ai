@@ -4,355 +4,374 @@ const cors = require('cors');
 const axios = require('axios');
 const cron = require('node-cron');
 const mongoose = require('mongoose');
+
 const app = express();
+app.use(cors({ origin: process.env.CORS_ORIGINS ? process.env.CORS_ORIGINS.split(',').map(s => s.trim()) : '*' }));
+app.use(express.json({ limit: '1mb' }));
 
-app.use(cors({ origin: '*' }));
-app.use(express.json());
+const PORT = Number(process.env.PORT || 5001);
+const MONGO_URI = process.env.MONGO_URI;
+const API_SPORTS_KEY = process.env.API_SPORTS_KEY;
+const FOOTBALL_DAILY_LIMIT = Math.max(1, Number.parseInt(process.env.FOOTBALL_DAILY_LIMIT || '20', 10));
+const BASKETBALL_DAILY_LIMIT = Math.max(1, Number.parseInt(process.env.BASKETBALL_DAILY_LIMIT || '10', 10));
+const FIXTURE_DAYS_AHEAD = Math.min(7, Math.max(1, Number.parseInt(process.env.FIXTURE_DAYS_AHEAD || '3', 10)));
+const API_TIMEOUT_MS = Math.max(5000, Number.parseInt(process.env.API_TIMEOUT_MS || '20000', 10));
 
-// --- MONGODB CONNECTION ---
-const MONGO_URI = process.env.MONGO_URI || 'mongodb://localhost:27017/matchai';
-
-// --- MONGODB SCHEMAS ---
 const PredictionSchema = new mongoose.Schema({
-  fixtureId: { type: String, unique: true, index: true },
-  sport: String, league: String, homeTeam: String, awayTeam: String, homeTeamId: Number, awayTeamId: Number,
-  date: Date, status: String, actualScore: String, predictedWinner: String, isFinished: { type: Boolean, default: false },
+  fixtureId: { type: String, required: true, unique: true, index: true },
+  sport: { type: String, enum: ['football', 'basketball'], required: true, index: true },
+  league: { type: String, default: 'Unknown' },
+  homeTeam: { type: String, required: true },
+  awayTeam: { type: String, required: true },
+  homeTeamId: Number,
+  awayTeamId: Number,
+  date: { type: Date, required: true, index: true },
+  status: { type: String, default: 'Scheduled', index: true },
+  actualScore: { type: String, default: null },
+  actualWinner: { type: String, default: null },
+  predictedWinner: { type: String, default: 'No reliable prediction' },
+  isFinished: { type: Boolean, default: false, index: true },
   isCorrect: { type: Boolean, default: null },
-  allMarkets: Array, bestMarketString: String, topCorrectScores: Array,
-  confidenceScore: String, dataQuality: String, recommendation: String, predictedScore: String,
-  aiExplanation: String, modelVersion: { type: String, default: 'v17.0 Full Fix' }
-});
-const Prediction = mongoose.model('Prediction', PredictionSchema);
+  allMarkets: { type: Array, default: [] },
+  bestMarketString: { type: String, default: 'No reliable market' },
+  topCorrectScores: { type: Array, default: [] },
+  confidenceScore: { type: String, default: '0' },
+  dataQuality: { type: String, default: 'LOW' },
+  recommendation: { type: String, default: 'NO STRONG PREDICTION' },
+  predictedScore: { type: String, default: 'N/A' },
+  aiExplanation: { type: String, default: '' },
+  missingData: { type: Array, default: [] },
+  modelVersion: { type: String, default: 'v19.0-fixture-fix' },
+  lastSyncedAt: { type: Date, default: Date.now },
+  errorDiagnosis: { type: String, default: null }
+}, { timestamps: true, strict: true });
 
-const HistorySchema = new mongoose.Schema({ ...PredictionSchema.obj, errorDiagnosis: String });
-const History = mongoose.model('History', HistorySchema);
+const HistorySchema = new mongoose.Schema({ ...PredictionSchema.obj }, { timestamps: true, strict: true });
+const Prediction = mongoose.models.Prediction || mongoose.model('Prediction', PredictionSchema);
+const History = mongoose.models.History || mongoose.model('History', HistorySchema);
 
-// --- ELITE PREDICTION ENGINE ---
-class PredictionEngine {
-  factorial(n) { if (n < 0) return 0; if (n === 0) return 1; let res = 1; for (let i = 2; i <= n; i++) res *= i; return res; }
-  poissonProb(expected, actual) { return Math.pow(expected, actual) * Math.exp(-expected) / this.factorial(actual); }
-
-  hashStrength(id) {
-    let h = id || 1;
-    for (let i = 0; i < 3; i++) h = (h * 31) % 1000;
-    return 0.3 + (h / 1000) * 0.7;
-  }
-
-  analyzeMatch(matchData) {
-    if (matchData.sport === 'basketball') return this.analyzeBasketball(matchData);
-    return this.analyzeFootball(matchData);
-  }
-
-  analyzeFootball(matchData) {
-    const { homeTeam, awayTeam, injuries, h2h, league, fixtureId } = matchData;
-    let homeStrength = 0, awayStrength = 0, missingDataPoints = [], warnings = [];
-    let homeAttack, homeDefense, awayAttack, awayDefense;
-    
-    if (homeTeam.form && homeTeam.form.last5 && homeTeam.form.last5.length > 0 && awayTeam.form && awayTeam.form.last5.length > 0) {
-      homeStrength = this.calculateForm(homeTeam.form);
-      awayStrength = this.calculateForm(awayTeam.form);
-      const hWins = homeTeam.form.last5.filter(v => v === 'W').length; 
-      const hLosses = homeTeam.form.last5.filter(v => v === 'L').length;
-      homeAttack = 1.0 + (hWins * 0.25) - (hLosses * 0.1); 
-      homeDefense = 1.2 - (hWins * 0.1) + (hLosses * 0.2);
-      const aWins = awayTeam.form.last5.filter(v => v === 'W').length; 
-      const aLosses = awayTeam.form.last5.filter(v => v === 'L').length;
-      awayAttack = 0.9 + (aWins * 0.25) - (aLosses * 0.1); 
-      awayDefense = 1.3 - (aWins * 0.1) + (aLosses * 0.2);
-    } else { 
-      homeStrength = this.hashStrength(homeTeam.id);
-      awayStrength = this.hashStrength(awayTeam.id);
-      homeAttack = 0.5 + (homeStrength * 2.0); 
-      homeDefense = 2.0 - homeStrength; 
-      awayAttack = 0.5 + (awayStrength * 2.0);
-      awayDefense = 2.0 - awayStrength;
-      missingDataPoints.push('Recent form unavailable. Using baseline strength model.'); 
-    }
-
-    homeStrength += 0.15; 
-    const totalScore = Math.max(0.1, homeStrength + awayStrength);
-    let homeWinProb = homeStrength / totalScore; 
-    let awayWinProb = awayStrength / totalScore;
-    let drawProb = 0.28 - (Math.abs(homeWinProb - awayWinProb) * 0.2);
-    
-    homeWinProb = homeWinProb * (1 - drawProb); 
-    awayWinProb = awayWinProb * (1 - drawProb);
-
-    const markets = [], correctScores = [];
-    const homeExpGoals = Math.max(0.15, (homeAttack * awayDefense) / 1.4); 
-    const awayExpGoals = Math.max(0.15, (awayAttack * homeDefense) / 1.4);
-    
-    for (let h = 0; h <= 4; h++) { 
-      for (let a = 0; a <= 4; a++) { 
-        const prob = this.poissonProb(homeExpGoals, h) * this.poissonProb(awayExpGoals, a); 
-        if (prob > 0.01) correctScores.push({ score: `${h}-${a}`, probability: prob }); 
-      } 
-    }
-    correctScores.sort((a, b) => b.probability - a.probability);
-    
-    const totalExpGoals = homeExpGoals + awayExpGoals;
-    const p0 = this.poissonProb(totalExpGoals, 0), p1 = this.poissonProb(totalExpGoals, 1), p2 = this.poissonProb(totalExpGoals, 2);
-    markets.push({ market: 'Match Winner', selection: homeTeam.name, probability: homeWinProb });
-    markets.push({ market: 'Match Winner', selection: 'Draw', probability: drawProb });
-    markets.push({ market: 'Match Winner', selection: awayTeam.name, probability: awayWinProb });
-    markets.push({ market: 'Double Chance', selection: `${homeTeam.name} or Draw`, probability: homeWinProb + drawProb });
-    markets.push({ market: 'Over/Under 1.5 Goals', selection: 'Over 1.5', probability: 1 - (p0 + p1) });
-    markets.push({ market: 'Over/Under 2.5 Goals', selection: 'Over 2.5', probability: 1 - (p0 + p1 + p2) });
-
-    const bestMarket = markets.length > 0 ? markets.reduce((max, m) => m.probability > max.probability ? m : max, markets[0]) : null;
-    const bestProb = bestMarket ? bestMarket.probability * 100 : 0;
-    const dataQuality = missingDataPoints.length > 2 ? 'LOW' : missingDataPoints.length > 0 ? 'MEDIUM' : 'HIGH';
-    let recommendation = (bestProb >= 70 && dataQuality !== 'LOW') ? 'HIGH-CONFIDENCE SELECTION' : 'NO STRONG PREDICTION';
-
-    return {
-      fixtureId, sport: 'football', league, homeTeam: homeTeam.name, awayTeam: awayTeam.name, homeTeamId: homeTeam.id, awayTeamId: awayTeam.id,
-      allMarkets: markets.map(m => ({...m, probability: (m.probability * 100).toFixed(1)})),
-      bestMarketString: bestMarket ? `${bestMarket.market} (${bestMarket.selection})` : 'No reliable market',
-      topCorrectScores: correctScores.slice(0, 5).map(s => ({ score: s.score, probability: (s.probability * 100).toFixed(1) })),
-      predictedWinner: homeWinProb > awayWinProb ? homeTeam.name : awayTeam.name,
-      confidenceScore: bestProb.toFixed(0), dataQuality, recommendation,
-      predictedScore: `${homeExpGoals.toFixed(0)}-${awayExpGoals.toFixed(0)}`,
-      warnings, missingData: missingDataPoints,
-      aiExplanation: `Football Analysis: ${bestMarket ? bestMarket.market + ' (' + bestMarket.selection + ')' : 'No market'} is the strongest outcome with ${bestProb.toFixed(1)}% prob.`
-    };
-  }
-
-  // NEW: Basketball Engine so they get real scores and display properly
-  analyzeBasketball(matchData) {
-    const { homeTeam, awayTeam, league, fixtureId } = matchData;
-    const homeStrength = this.hashStrength(homeTeam.id);
-    const awayStrength = this.hashStrength(awayTeam.id);
-    
-    const totalStrength = homeStrength + awayStrength + 0.15; 
-    let homeWinProb = (homeStrength + 0.15) / totalStrength;
-    let awayWinProb = awayStrength / totalStrength;
-    
-    const homeExpPoints = Math.round(100 + homeStrength * 25);
-    const awayExpPoints = Math.round(95 + awayStrength * 25);
-    
-    const markets = [
-      { market: 'Match Winner', selection: homeTeam.name, probability: homeWinProb },
-      { market: 'Match Winner', selection: awayTeam.name, probability: awayWinProb }
-    ];
-    
-    const bestMarket = markets.reduce((max, m) => m.probability > max.probability ? m : max, markets[0]);
-    const bestProb = bestMarket.probability * 100;
-    
-    return {
-      fixtureId, sport: 'basketball', league, homeTeam: homeTeam.name, awayTeam: awayTeam.name, 
-      homeTeamId: homeTeam.id, awayTeamId: awayTeam.id,
-      allMarkets: markets.map(m => ({...m, probability: (m.probability * 100).toFixed(1)})),
-      bestMarketString: `${bestMarket.market} (${bestMarket.selection})`,
-      topCorrectScores: [], 
-      predictedWinner: homeWinProb > awayWinProb ? homeTeam.name : awayTeam.name,
-      confidenceScore: bestProb.toFixed(0), dataQuality: 'MEDIUM', recommendation: bestProb >= 60 ? 'MODERATE SELECTION' : 'NO STRONG PREDICTION',
-      predictedScore: `${homeExpPoints}-${awayExpPoints}`,
-      warnings: [], missingData: ['Basketball form fetch skipped to preserve API limits.'],
-      aiExplanation: `Basketball Analysis: ${bestMarket.selection} has a ${bestProb.toFixed(1)}% probability based on baseline strength.`
-    };
-  }
-
-  calculateForm(form) { if (!form || !form.last5) return 0.5; return form.last5.reduce((acc, val) => acc + (val === 'W' ? 3 : val === 'D' ? 1 : 0), 0) / 15; }
+function dateStringUTC(date) {
+  return date.toISOString().slice(0, 10);
 }
 
-const engine = new PredictionEngine();
-
-async function getRealFootballForm(teamId, apiKey, headers) {
-  try {
-    const res = await axios.get(`https://v3.football.api-sports.io/fixtures?team=${teamId}&last=5`, { headers });
-    if (!res.data.response || res.data.response.length === 0) return null;
-    const last5 = res.data.response.map(game => {
-      const isHome = game.teams.home.id === teamId;
-      const homeScore = game.goals.home || 0, awayScore = game.goals.away || 0;
-      const teamScore = isHome ? homeScore : awayScore;
-      const oppScore = isHome ? awayScore : homeScore;
-      if (teamScore > oppScore) return 'W';
-      if (teamScore < oppScore) return 'L';
-      return 'D';
-    });
-    return { last5 };
-  } catch { return null; }
+function getDateStrings(daysAhead) {
+  const dates = [];
+  const now = new Date();
+  for (let i = 0; i < daysAhead; i++) {
+    const d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + i));
+    dates.push(dateStringUTC(d));
+  }
+  return dates;
 }
 
-// --- AUTOMATED WORKER ---
+function poisson(lambda, goals) {
+  if (!Number.isFinite(lambda) || lambda < 0 || goals < 0) return 0;
+  let factorial = 1;
+  for (let i = 2; i <= goals; i++) factorial *= i;
+  return (Math.pow(lambda, goals) * Math.exp(-lambda)) / factorial;
+}
+
+// This baseline only creates a clearly-labelled estimate. It does not claim to use form,
+// injuries, lineups, odds, or other statistics that this service has not fetched.
+function makeFootballPrediction(game) {
+  const home = game.teams.home.name;
+  const away = game.teams.away.name;
+  const league = game.league?.name || 'Unknown';
+  const homeXG = 1.45;
+  const awayXG = 1.15;
+  let homeWin = 0, draw = 0, awayWin = 0;
+  const scores = [];
+  for (let h = 0; h <= 8; h++) {
+    for (let a = 0; a <= 8; a++) {
+      const p = poisson(homeXG, h) * poisson(awayXG, a);
+      scores.push({ score: `${h}-${a}`, probability: p });
+      if (h > a) homeWin += p;
+      else if (h === a) draw += p;
+      else awayWin += p;
+    }
+  }
+  const total = homeWin + draw + awayWin || 1;
+  homeWin /= total; draw /= total; awayWin /= total;
+  const totalGoals = homeXG + awayXG;
+  const p0 = poisson(totalGoals, 0);
+  const p1 = poisson(totalGoals, 1);
+  const p2 = poisson(totalGoals, 2);
+  const over15 = Math.max(0, Math.min(1, 1 - p0 - p1));
+  const over25 = Math.max(0, Math.min(1, 1 - p0 - p1 - p2));
+  const markets = [
+    { market: 'Match Winner', selection: home, probability: homeWin },
+    { market: 'Match Winner', selection: 'Draw', probability: draw },
+    { market: 'Match Winner', selection: away, probability: awayWin },
+    { market: 'Double Chance', selection: `${home} or Draw`, probability: homeWin + draw },
+    { market: 'Over/Under 1.5 Goals', selection: 'Over 1.5', probability: over15 },
+    { market: 'Over/Under 2.5 Goals', selection: 'Over 2.5', probability: over25 }
+  ];
+  // Keep market comparisons within a market type; do not call a double-chance percentage
+  // the probability that a team wins.
+  const winnerMarkets = markets.filter(m => m.market === 'Match Winner');
+  const likelyWinner = winnerMarkets.reduce((best, item) => item.probability > best.probability ? item : best, winnerMarkets[0]);
+  const bestMarket = markets.reduce((best, item) => item.probability > best.probability ? item : best, markets[0]);
+  scores.sort((a, b) => b.probability - a.probability);
+  return {
+    fixtureId: `apifoot_${game.fixture.id}`,
+    sport: 'football', league, homeTeam: home, awayTeam: away,
+    homeTeamId: game.teams.home.id, awayTeamId: game.teams.away.id,
+    date: new Date(game.fixture.date), status: 'Scheduled', isFinished: false,
+    allMarkets: markets.map(m => ({ ...m, probability: (m.probability * 100).toFixed(1) })),
+    bestMarketString: `${bestMarket.market} (${bestMarket.selection})`,
+    topCorrectScores: scores.slice(0, 5).map(s => ({ score: s.score, probability: (s.probability * 100).toFixed(1) })),
+    predictedWinner: likelyWinner.probability >= 0.45 ? likelyWinner.selection : 'No reliable prediction',
+    confidenceScore: (likelyWinner.probability * 100).toFixed(1),
+    dataQuality: 'LOW',
+    recommendation: 'BASELINE ONLY — VERIFY REAL TEAM DATA',
+    predictedScore: `${Math.round(homeXG)}-${Math.round(awayXG)}`,
+    missingData: ['Real team form, goals for/against, injuries, lineups, and odds were not fetched.'],
+    aiExplanation: 'Baseline Poisson estimate using generic expected-goal values only. It is not a verified, form-based prediction.',
+    modelVersion: 'v19.0-fixture-fix'
+  };
+}
+
+function makeBasketballPrediction(game) {
+  const home = game.teams?.home?.name || 'Home team';
+  const away = game.teams?.away?.name || 'Away team';
+  return {
+    fixtureId: `apibball_${game.id}`,
+    sport: 'basketball', league: game.league?.name || 'Unknown', homeTeam: home, awayTeam: away,
+    homeTeamId: game.teams?.home?.id, awayTeamId: game.teams?.away?.id,
+    date: new Date(game.date), status: 'Scheduled', isFinished: false,
+    allMarkets: [], bestMarketString: 'No reliable market', topCorrectScores: [],
+    predictedWinner: 'No reliable prediction', confidenceScore: '0', dataQuality: 'LOW',
+    recommendation: 'NO PREDICTION — REAL BASKETBALL STATS REQUIRED', predictedScore: 'N/A',
+    missingData: ['Recent team scores and team statistics have not been fetched.'],
+    aiExplanation: 'Fixture found, but a prediction is withheld because this code does not yet fetch basketball performance data.',
+    modelVersion: 'v19.0-fixture-fix'
+  };
+}
+
+async function fetchFootballFixtures(headers, dateStr) {
+  const url = 'https://v3.football.api-sports.io/fixtures';
+  const response = await axios.get(url, { headers, params: { date: dateStr }, timeout: API_TIMEOUT_MS });
+  if (response.data?.errors && Object.keys(response.data.errors).length) {
+    throw new Error(`Football API errors for ${dateStr}: ${JSON.stringify(response.data.errors)}`);
+  }
+  if (!Array.isArray(response.data?.response)) {
+    throw new Error(`Unexpected football API response for ${dateStr}`);
+  }
+  return response.data.response;
+}
+
+async function fetchBasketballGames(headers, dateStr) {
+  const url = 'https://v1.basketball.api-sports.io/games';
+  const response = await axios.get(url, { headers, params: { date: dateStr }, timeout: API_TIMEOUT_MS });
+  if (response.data?.errors && Object.keys(response.data.errors).length) {
+    throw new Error(`Basketball API errors for ${dateStr}: ${JSON.stringify(response.data.errors)}`);
+  }
+  if (!Array.isArray(response.data?.response)) {
+    throw new Error(`Unexpected basketball API response for ${dateStr}`);
+  }
+  return response.data.response;
+}
+
+async function saveNewPredictions(fixtures, sport, limit) {
+  const candidates = fixtures.filter(item => item && item.fixtureId && item.date && new Date(item.date) >= new Date());
+  candidates.sort((a, b) => new Date(a.date) - new Date(b.date));
+  if (!candidates.length) return { eligible: 0, saved: 0, duplicates: 0, dailyRemaining: limit };
+
+  // Enforce the configured number of newly-created predictions per UTC calendar day.
+  const now = new Date();
+  const utcDayStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+  const createdToday = await Prediction.countDocuments({ sport, createdAt: { $gte: utcDayStart } });
+  const dailyRemaining = Math.max(0, limit - createdToday);
+  if (dailyRemaining === 0) {
+    return { eligible: candidates.length, saved: 0, duplicates: 0, dailyRemaining: 0, dailyLimitReached: true };
+  }
+
+  const ids = candidates.map(item => item.fixtureId);
+  const existing = await Prediction.find({ fixtureId: { $in: ids } }).select('fixtureId').lean();
+  const existingIds = new Set(existing.map(item => item.fixtureId));
+  const newItems = candidates.filter(item => !existingIds.has(item.fixtureId)).slice(0, dailyRemaining);
+  let saved = 0;
+  let duplicates = 0;
+  for (const item of newItems) {
+    try {
+      // Upsert makes the save idempotent if two worker runs overlap.
+      const result = await Prediction.updateOne(
+        { fixtureId: item.fixtureId },
+        { $setOnInsert: item, $set: { lastSyncedAt: new Date() } },
+        { upsert: true, runValidators: true }
+      );
+      if (result.upsertedCount > 0) saved++;
+      else duplicates++;
+    } catch (err) {
+      if (err.code === 11000) duplicates++;
+      else throw err;
+    }
+  }
+  return { eligible: candidates.length, saved, duplicates, dailyRemaining: Math.max(0, dailyRemaining - saved) };
+}
+
+let cycleRunning = false;
 async function runDailyCycle() {
-  console.log(`[$] [${new Date().toLocaleTimeString()}] Running Safe Cycle...`);
-  const apiKey = process.env.API_SPORTS_KEY;
-  if (!apiKey) return console.log('[!] Missing API_SPORTS_KEY.');
-  const headers = { 'x-apisports-key': apiKey };
-
-  const todayStr = new Date().toISOString().split('T')[0];
-  const tomStr = new Date(Date.now() + 86400000).toISOString().split('T')[0];
-  const footLimit = parseInt(process.env.FOOTBALL_DAILY_LIMIT || '20');
-  const bballLimit = parseInt(process.env.BASKETBALL_DAILY_LIMIT || '10');
-
-  // 1. FOOTBALL
+  if (cycleRunning) {
+    console.log('[Worker] A cycle is already running; skipping overlapping run.');
+    return { skipped: true };
+  }
+  if (!API_SPORTS_KEY) throw new Error('Missing API_SPORTS_KEY environment variable.');
+  if (mongoose.connection.readyState !== 1) throw new Error('MongoDB is not connected.');
+  cycleRunning = true;
+  const headers = { 'x-apisports-key': API_SPORTS_KEY };
+  const dates = getDateStrings(FIXTURE_DAYS_AHEAD);
+  const summary = { dates, football: null, basketball: null };
   try {
-    let footFixtures = [];
-    for (const dateStr of [todayStr, tomStr]) {
-      const res = await axios.get(`https://v3.football.api-sports.io/fixtures?date=${dateStr}`, { headers });
-      footFixtures = footFixtures.concat(res.data.response.filter(g => g.fixture.status.short === 'NS'));
+    const footballFixtures = [];
+    for (const dateStr of dates) {
+      try {
+        const rows = await fetchFootballFixtures(headers, dateStr);
+        footballFixtures.push(...rows.filter(g => ['NS', 'TBD'].includes(g.fixture?.status?.short)));
+      } catch (err) {
+        console.error(`[Football] ${dateStr}: ${err.message}`);
+      }
     }
-    
-    footFixtures = footFixtures.slice(0, footLimit);
-    let newFootCount = 0;
+    const footballItems = footballFixtures.map(makeFootballPrediction);
+    summary.football = await saveNewPredictions(footballItems, 'football', FOOTBALL_DAILY_LIMIT);
+    console.log(`[Football] Dates=${dates.join(',')} eligible=${summary.football.eligible} saved=${summary.football.saved} duplicates=${summary.football.duplicates}`);
 
-    for (const game of footFixtures) {
-      const matchId = `apifoot_${game.fixture.id}`;
-      const existing = await Prediction.findOne({ fixtureId: matchId });
-      if (existing) continue;
-
-      const homeForm = await getRealFootballForm(game.teams.home.id, apiKey, headers);
-      const awayForm = await getRealFootballForm(game.teams.away.id, apiKey, headers);
-      
-      const mockMatch = {
-        fixtureId: matchId, sport: 'football', league: game.league.name || 'Unknown',
-        matchDate: game.fixture.date,
-        homeTeam: { name: game.teams.home.name, id: game.teams.home.id, form: homeForm, venueRecord: { winPct: 0.6, awayWinPct: 0.3 } },
-        awayTeam: { name: game.teams.away.name, id: game.teams.away.id, form: awayForm, venueRecord: { winPct: 0.4, awayWinPct: 0.2 } },
-        injuries: { verified: false }, h2h: [{ winner: game.teams.home.id }, { winner: game.teams.away.id }, { winner: game.teams.home.id }]
-      };
-      const prediction = engine.analyzeFootball(mockMatch); 
-      prediction.date = game.fixture.date; prediction.status = 'Scheduled';
-      await Prediction.create(prediction);
-      newFootCount++;
+    const basketballGames = [];
+    for (const dateStr of dates) {
+      try {
+        const rows = await fetchBasketballGames(headers, dateStr);
+        basketballGames.push(...rows.filter(g => ['NS', 'TBD'].includes(g.status?.short)));
+      } catch (err) {
+        console.error(`[Basketball] ${dateStr}: ${err.message}`);
+      }
     }
-    console.log(`[$] Football Cycle Complete. Saved ${newFootCount} new matches.`);
-  } catch (err) { console.error('[X] Football API Error:', err.response?.statusText || err.message); }
-
-  // 2. BASKETBALL 
-  try {
-    let bballGames = [];
-    for (const dateStr of [todayStr, tomStr]) {
-      const res = await axios.get(`https://v1.basketball.api-sports.io/games?date=${dateStr}`, { headers });
-      bballGames = bballGames.concat(res.data.response.filter(g => g.status?.short === 'NS'));
-    }
-    bballGames = bballGames.slice(0, bballLimit);
-    let newBballCount = 0;
-
-    for (const game of bballGames) {
-      const matchId = `apibball_${game.id}`;
-      const existing = await Prediction.findOne({ fixtureId: matchId });
-      if (existing) continue;
-
-      const mockMatch = {
-        fixtureId: matchId, sport: 'basketball', league: game.league.name || 'NBA', date: game.date,
-        homeTeam: { name: String(game.teams.home.name), id: game.teams.home.id }, 
-        awayTeam: { name: String(game.teams.away.name), id: game.teams.away.id }
-      };
-      const prediction = engine.analyzeBasketball(mockMatch); 
-      prediction.status = 'Scheduled';
-      await Prediction.create(prediction);
-      newBballCount++;
-    }
-    console.log(`[$] Basketball Cycle Complete. Saved ${newBballCount} new matches.`);
-  } catch (err) { console.error('[X] Basketball API Error:', err.response?.statusText || err.message); }
-
-  // Automatically send Telegram predictions after cycle finishes!
-  await sendTelegramPredictions();
+    const basketballItems = basketballGames.map(makeBasketballPrediction);
+    summary.basketball = await saveNewPredictions(basketballItems, 'basketball', BASKETBALL_DAILY_LIMIT);
+    console.log(`[Basketball] Dates=${dates.join(',')} eligible=${summary.basketball.eligible} saved=${summary.basketball.saved} duplicates=${summary.basketball.duplicates}`);
+    await sendTelegramPredictions();
+    return summary;
+  } finally {
+    cycleRunning = false;
+  }
 }
 
-// --- AUTOMATIC CLEANUP ---
+// Never automatically delete a fixture simply because kickoff is in the past.
+// Completed-result syncing should be implemented before moving records to History.
 async function cleanupOldMatches() {
-  try {
-    const threeHoursAgo = new Date(Date.now() - 3 * 60 * 60 * 1000);
-    const oldMatches = await Prediction.find({ date: { $lt: threeHoursAgo }, status: { $ne: 'LIVE' } });
-    for (const match of oldMatches) await Prediction.deleteOne({ _id: match._id });
-    if (oldMatches.length > 0) console.log(`[$] Cleanup complete. Removed ${oldMatches.length} old matches.`);
-  } catch (err) { console.error('[X] Cleanup Error:', err.message); }
+  console.log('[Cleanup] Automatic deletion is disabled to preserve predictions and history.');
+  return { deleted: 0 };
 }
 
-// --- API ROUTES ---
-app.get('/health', (req, res) => res.json({ ok: true, db: mongoose.connection.readyState === 1 }));
+app.get('/health', (req, res) => res.json({
+  ok: true,
+  dbConnected: mongoose.connection.readyState === 1,
+  apiKeyConfigured: Boolean(API_SPORTS_KEY),
+  time: new Date().toISOString()
+}));
 
 app.get('/api/predictions', async (req, res) => {
   try {
-    const preds = await Prediction.find().sort({ date: 1 });
-    res.json({ predictions: preds, counts: { football: preds.filter(p=>p.sport==='football').length, basketball: preds.filter(p=>p.sport==='basketball').length } });
-  } catch { res.status(500).json({ error: 'Failed' }); }
+    const filter = {};
+    if (['football', 'basketball'].includes(req.query.sport)) filter.sport = req.query.sport;
+    const preds = await Prediction.find(filter).sort({ date: 1 }).limit(1000).lean();
+    res.json({ predictions: preds, counts: {
+      football: preds.filter(p => p.sport === 'football').length,
+      basketball: preds.filter(p => p.sport === 'basketball').length,
+      total: preds.length
+    } });
+  } catch (err) {
+    console.error('[Route] /api/predictions:', err.message);
+    res.status(500).json({ error: 'Failed to retrieve predictions.' });
+  }
 });
 
 app.get('/api/history', async (req, res) => {
   try {
-    const history = await History.find().sort({ _id: -1 }).limit(100);
-    const acc = history.length > 0 ? (history.filter(p => p.isCorrect).length / history.length * 100).toFixed(1) : 0;
-    res.json({ history, accuracy: acc });
-  } catch { res.status(500).json({ error: 'Failed' }); }
+    const history = await History.find().sort({ date: -1 }).limit(200).lean();
+    const settled = history.filter(p => typeof p.isCorrect === 'boolean');
+    const accuracy = settled.length ? (settled.filter(p => p.isCorrect).length / settled.length * 100).toFixed(1) : '0.0';
+    res.json({ history, accuracy, sampleSize: settled.length });
+  } catch (err) {
+    console.error('[Route] /api/history:', err.message);
+    res.status(500).json({ error: 'Failed to retrieve history.' });
+  }
 });
 
 app.get('/api/analytics', async (req, res) => {
   try {
-    const history = await History.find();
-    if (history.length === 0) return res.json({ sampleSize: 0, accuracy: 0, brierScore: 0 });
-    const correct = history.filter(p => p.isCorrect).length;
-    const accuracy = (correct / history.length * 100).toFixed(1);
-    res.json({ sampleSize: history.length, accuracy, brierScore: '0.000' });
-  } catch { res.status(500).json({ error: 'Failed' }); }
+    const settled = await Prediction.find({ isFinished: true, isCorrect: { $ne: null } }).select('sport isCorrect').lean();
+    const correct = settled.filter(p => p.isCorrect).length;
+    res.json({ sampleSize: settled.length, correct, accuracy: settled.length ? Number((correct / settled.length * 100).toFixed(1)) : null, note: 'Accuracy is calculated only from records marked finished with a settled correctness value. Calibration metrics are not calculated by this endpoint.' });
+  } catch (err) {
+    console.error('[Route] /api/analytics:', err.message);
+    res.status(500).json({ error: 'Failed to calculate analytics.' });
+  }
 });
 
-// --- PROTECTED ADMIN ROUTES ---
 const adminAuth = (req, res, next) => {
-  if (req.headers['x-admin-key'] !== process.env.ADMIN_API_KEY) return res.status(401).json({ error: 'Unauthorized' });
+  const configuredKey = process.env.ADMIN_API_KEY;
+  if (!configuredKey) return res.status(503).json({ error: 'ADMIN_API_KEY is not configured.' });
+  if (req.get('x-admin-key') !== configuredKey) return res.status(401).json({ error: 'Unauthorized.' });
   next();
 };
 
 app.post('/api/admin/run-cycle', adminAuth, async (req, res) => {
-  await runDailyCycle();
-  await cleanupOldMatches();
-  res.json({ message: 'Cycle triggered successfully.' });
+  try {
+    const result = await runDailyCycle();
+    res.json({ message: result.skipped ? 'Cycle already running.' : 'Cycle completed.', result });
+  } catch (err) {
+    console.error('[Admin] run-cycle failed:', err.message);
+    res.status(500).json({ error: err.message });
+  }
 });
 
-// RESTORED: Easy Manual Telegram Trigger
 async function sendTelegramPredictions() {
   const botToken = process.env.TELEGRAM_BOT_TOKEN;
   const chatId = process.env.TELEGRAM_CHAT_ID || '@MatchIntelligenceAI';
-  if (!botToken) return console.log('[!] Telegram Bot Token missing.');
+  if (!botToken) return;
   try {
-    const topPicks = await Prediction.find({ status: 'Scheduled', predictedWinner: { $ne: 'No reliable prediction' } }).sort({ confidenceScore: -1 }).limit(3);
-    if (topPicks.length === 0) return console.log('[!] No reliable predictions to send to Telegram.');
-    let message = `⚽️ *MATCH INTELLIGENCE AI - TOP PICKS* ⚽️\n\n`;
-    topPicks.forEach((pick, index) => {
-      message += `*${index + 1}. ${pick.homeTeam} vs ${pick.awayTeam}*\n`;
-      message += `League: ${pick.league}\n`;
-      message += `Best Market: ${pick.bestMarketString} (${pick.confidenceScore}%)\n`;
-      message += `Predicted Score: ${pick.predictedScore}\n\n`;
+    const picks = await Prediction.find({ status: 'Scheduled', sport: 'football', dataQuality: 'HIGH' }).sort({ confidenceScore: -1 }).limit(3).lean();
+    if (!picks.length) {
+      console.log('[Telegram] No high-quality football picks to send; no message sent.');
+      return;
+    }
+    const lines = ['⚽ MATCH INTELLIGENCE AI — TOP PICKS', ''];
+    picks.forEach((p, i) => {
+      lines.push(`${i + 1}. ${p.homeTeam} vs ${p.awayTeam}`);
+      lines.push(`League: ${p.league}`);
+      lines.push(`Selection: ${p.bestMarketString}`);
+      lines.push(`Confidence estimate: ${p.confidenceScore}%`);
+      lines.push('');
     });
-    message += `⚠️ Bet responsibly. Probabilities, not guarantees.`;
-    await axios.post(`https://api.telegram.org/bot${botToken}/sendMessage`, { chat_id: chatId, text: message, parse_mode: 'Markdown' });
-    console.log('[$] Sent predictions to Telegram automatically.');
-  } catch (err) { console.error('[X] Telegram Error:', err.response?.data || err.message); }
+    lines.push('Probabilities are estimates, not guarantees. Bet responsibly.');
+    await axios.post(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+      chat_id: chatId, text: lines.join('\n'), disable_web_page_preview: true
+    }, { timeout: API_TIMEOUT_MS });
+    console.log('[Telegram] Picks sent.');
+  } catch (err) {
+    console.error('[Telegram] Send failed:', err.response?.data || err.message);
+  }
 }
 
-app.get('/api/trigger-telegram', async (req, res) => {
-  try {
-    console.log('[!] Manual Telegram trigger received.');
-    await sendTelegramPredictions();
-    res.json({ message: 'Telegram prediction trigger sent successfully! Check your channel.' });
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to send Telegram message.', details: err.message });
-  }
-});
-
-// --- START SERVER ---
 async function startServer() {
+  if (!MONGO_URI) {
+    console.error('[Startup] MONGO_URI is missing. Server will not start without a database.');
+    process.exit(1);
+  }
   try {
-    await mongoose.connect(MONGO_URI);
-    console.log('[$] MongoDB Connected.');
-    app.listen(process.env.PORT || 5001, () => console.log(`Match Intelligence AI 24/7 Server running.`));
-
-    const count = await Prediction.countDocuments();
-    if (count === 0) await runDailyCycle();
-    else await cleanupOldMatches();
-
-     // Run every 10 minutes to fetch new matches AND clean up old ones
-    cron.schedule('*/10 * * * *', () => {
-      runDailyCycle();
-      cleanupOldMatches();
+    await mongoose.connect(MONGO_URI, { serverSelectionTimeoutMS: 15000 });
+    console.log('[Startup] MongoDB connected.');
+    app.listen(PORT, () => console.log(`[Startup] Match Intelligence AI listening on port ${PORT}.`));
+    // Fetch immediately regardless of whether the database already has records.
+    runDailyCycle().catch(err => console.error('[Startup] Initial fixture cycle failed:', err.message));
+    cron.schedule('0 * * * *', () => {
+      runDailyCycle().catch(err => console.error('[Scheduler] Fixture cycle failed:', err.message));
     });
   } catch (err) {
-    console.error('[X] Failed to start:', err.message);
-    app.listen(process.env.PORT || 5001, () => console.log(`Server running (DB Offline).`));
+    console.error('[Startup] Failed to connect to MongoDB:', err.message);
+    process.exit(1);
   }
 }
 
-startServer();
+if (require.main === module) startServer();
+module.exports = { app, runDailyCycle, makeFootballPrediction, makeBasketballPrediction, getDateStrings };
