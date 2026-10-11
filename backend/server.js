@@ -20,7 +20,7 @@ const PredictionSchema = new mongoose.Schema({
   isCorrect: { type: Boolean, default: null },
   allMarkets: Array, bestMarketString: String, topCorrectScores: Array,
   confidenceScore: String, dataQuality: String, recommendation: String, predictedScore: String,
-  aiExplanation: String, modelVersion: { type: String, default: 'v14.0 Baseline Fix' }
+  aiExplanation: String, modelVersion: { type: String, default: 'v16.0 Hash Fix' }
 });
 const Prediction = mongoose.model('Prediction', PredictionSchema);
 
@@ -35,16 +35,22 @@ class PredictionEngine {
   factorial(n) { if (n < 0) return 0; if (n === 0) return 1; let res = 1; for (let i = 2; i <= n; i++) res *= i; return res; }
   poissonProb(expected, actual) { return Math.pow(expected, actual) * Math.exp(-expected) / this.factorial(actual); }
 
+  // Helper to create a stable, unique strength rating (0.3 to 1.0) from a Team ID
+  hashStrength(id) {
+    let h = id || 1;
+    for (let i = 0; i < 3; i++) h = (h * 31) % 1000;
+    return 0.3 + (h / 1000) * 0.7;
+  }
+
   analyzeFootball(matchData) {
     const { homeTeam, awayTeam, injuries, h2h, league, fixtureId } = matchData;
-    let homeScore = 0, awayScore = 0, missingDataPoints = [], warnings = [];
-    
+    let homeStrength = 0, awayStrength = 0, missingDataPoints = [], warnings = [];
     let homeAttack, homeDefense, awayAttack, awayDefense;
     
-    // FIX: Properly check if form exists AND has length > 0
     if (homeTeam.form && homeTeam.form.last5 && homeTeam.form.last5.length > 0 && awayTeam.form && awayTeam.form.last5.length > 0) {
-      homeScore += (this.calculateForm(homeTeam.form) * this.footballWeights.form);
-      awayScore += (this.calculateForm(awayTeam.form) * this.footballWeights.form);
+      // Real Form Logic
+      homeStrength = this.calculateForm(homeTeam.form);
+      awayStrength = this.calculateForm(awayTeam.form);
       const hWins = homeTeam.form.last5.filter(v => v === 'W').length; 
       const hLosses = homeTeam.form.last5.filter(v => v === 'L').length;
       homeAttack = 1.0 + (hWins * 0.25) - (hLosses * 0.1); 
@@ -54,38 +60,31 @@ class PredictionEngine {
       awayAttack = 0.9 + (aWins * 0.25) - (aLosses * 0.1); 
       awayDefense = 1.3 - (aWins * 0.1) + (aLosses * 0.2);
     } else { 
-      // Deterministic Baseline based on unique Team ID so every team is mathematically unique
-      homeAttack = 1.1 + ((homeTeam.id % 10) / 15); 
-      homeDefense = 1.2 - ((homeTeam.id % 5) / 15);
-      awayAttack = 1.1 + ((awayTeam.id % 10) / 15);
-      awayDefense = 1.2 - ((awayTeam.id % 5) / 15);
+      // FIX: Deterministic Baseline using Hash Strength
+      homeStrength = this.hashStrength(homeTeam.id);
+      awayStrength = this.hashStrength(awayTeam.id);
+      homeAttack = 0.5 + (homeStrength * 2.0); 
+      homeDefense = 2.0 - homeStrength; 
+      awayAttack = 0.5 + (awayStrength * 2.0);
+      awayDefense = 2.0 - awayStrength;
       missingDataPoints.push('Recent form unavailable. Using baseline strength model.'); 
     }
 
-    // Ensure home advantage is applied safely
-    if (homeTeam.venueRecord && awayTeam.venueRecord) { 
-      homeScore += (homeTeam.venueRecord.winPct || 0.5) * 0.1; 
-      awayScore += (awayTeam.venueRecord.awayWinPct || 0.2) * 0.1; 
-    } else {
-      homeScore += 0.15; // Default home advantage
-    }
+    // Apply Home Advantage
+    homeStrength += 0.15; 
 
-    // Ensure scores are never negative/zero to avoid NaN math
-    homeScore = Math.max(0.1, homeScore);
-    awayScore = Math.max(0.1, awayScore);
-
-    const totalScore = homeScore + awayScore;
-    let homeWinProb = homeScore / totalScore; 
-    let awayWinProb = awayScore / totalScore;
+    const totalScore = Math.max(0.1, homeStrength + awayStrength);
+    let homeWinProb = homeStrength / totalScore; 
+    let awayWinProb = awayStrength / totalScore;
     let drawProb = 0.28 - (Math.abs(homeWinProb - awayWinProb) * 0.2);
     
     homeWinProb = homeWinProb * (1 - drawProb); 
     awayWinProb = awayWinProb * (1 - drawProb);
 
     const markets = [], correctScores = [];
-    // Ensure expected goals are strictly positive > 0
-    const homeExpGoals = Math.max(0.15, (homeAttack * awayDefense) / 1.2); 
-    const awayExpGoals = Math.max(0.15, (awayAttack * homeDefense) / 1.2);
+    // Divisor 1.4 to create realistic goal spreads
+    const homeExpGoals = Math.max(0.15, (homeAttack * awayDefense) / 1.4); 
+    const awayExpGoals = Math.max(0.15, (awayAttack * homeDefense) / 1.4);
     
     for (let h = 0; h <= 4; h++) { 
       for (let a = 0; a <= 4; a++) { 
@@ -127,11 +126,10 @@ class PredictionEngine {
 
 const engine = new PredictionEngine();
 
-// --- HELPER: Fetch real recent form safely ---
 async function getRealFootballForm(teamId, apiKey, headers) {
   try {
     const res = await axios.get(`https://v3.football.api-sports.io/fixtures?team=${teamId}&last=5`, { headers });
-    if (!res.data.response || res.data.response.length === 0) return null; // Return null if empty
+    if (!res.data.response || res.data.response.length === 0) return null;
     const last5 = res.data.response.map(game => {
       const isHome = game.teams.home.id === teamId;
       const homeScore = game.goals.home || 0, awayScore = game.goals.away || 0;
@@ -206,18 +204,13 @@ async function runDailyCycle() {
       const existing = await Prediction.findOne({ fixtureId: matchId });
       if (existing) continue;
 
-      const mockMatch = {
-        fixtureId: matchId, sport: 'basketball', league: game.league.name || 'NBA',
-        matchDate: game.date,
-        homeTeam: { name: game.teams.home.name, id: game.teams.home.id, form: null }, 
-        awayTeam: { name: game.teams.away.name, id: game.teams.away.id, form: null }
-      };
       const prediction = {
-        ...mockMatch, predictedWinner: 'No reliable prediction', confidenceScore: '0', dataQuality: 'LOW',
-        recommendation: 'NO STRONG PREDICTION', predictedScore: 'N/A', allMarkets: [], topCorrectScores: [],
-        bestMarketString: 'No reliable market', aiExplanation: 'Basketball form fetch skipped to preserve API limits.'
+        fixtureId: matchId, sport: 'basketball', league: game.league.name || 'NBA', date: game.date, status: 'Scheduled',
+        homeTeam: game.teams.home.name, awayTeam: game.teams.away.name, homeTeamId: game.teams.home.id, awayTeamId: game.teams.away.id,
+        predictedWinner: 'No reliable prediction', confidenceScore: '0', dataQuality: 'LOW', recommendation: 'NO STRONG PREDICTION', 
+        predictedScore: 'N/A', allMarkets: [], topCorrectScores: [], bestMarketString: 'No reliable market', 
+        aiExplanation: 'Basketball form fetch skipped to preserve API limits.'
       };
-      prediction.date = game.date; prediction.status = 'Scheduled';
       await Prediction.create(prediction);
       newBballCount++;
     }
@@ -275,7 +268,6 @@ app.post('/api/admin/run-cycle', adminAuth, async (req, res) => {
   res.json({ message: 'Cycle triggered successfully.' });
 });
 
-// Optional Telegram
 async function sendTelegramPredictions() {
   const botToken = process.env.TELEGRAM_BOT_TOKEN;
   const chatId = process.env.TELEGRAM_CHAT_ID;
