@@ -1,3 +1,4 @@
+
 import { useState, useEffect, useCallback, useMemo } from 'react';
 import axios from 'axios';
 
@@ -7,6 +8,7 @@ const API_BASE_URL = (
 ).replace(/\/+$/, '');
 
 const REFRESH_INTERVAL = 30000;
+const TIME_ZONE = 'Africa/Accra';
 
 const DAYS_OF_WEEK = [
   'Monday',
@@ -18,43 +20,133 @@ const DAYS_OF_WEEK = [
   'Sunday',
 ];
 
-function getMonday(date) {
+const dateFormatter = new Intl.DateTimeFormat('en-CA', {
+  timeZone: TIME_ZONE,
+  year: 'numeric',
+  month: '2-digit',
+  day: '2-digit',
+});
+
+const dateTimeFormatter = new Intl.DateTimeFormat('en-GB', {
+  timeZone: TIME_ZONE,
+  weekday: 'long',
+  day: 'numeric',
+  month: 'long',
+  year: 'numeric',
+});
+
+const timeFormatter = new Intl.DateTimeFormat('en-GB', {
+  timeZone: TIME_ZONE,
+  hour: '2-digit',
+  minute: '2-digit',
+  hourCycle: 'h23',
+});
+
+function isValidDate(value) {
+  return (
+    value !== null &&
+    value !== undefined &&
+    value !== '' &&
+    !Number.isNaN(new Date(value).getTime())
+  );
+}
+
+// Always derive the calendar date in Ghana, not the visitor's browser timezone.
+function getDateKey(value) {
+  if (!isValidDate(value)) return null;
+
+  const parts = dateFormatter.formatToParts(new Date(value));
+  const part = (type) => parts.find((item) => item.type === type)?.value;
+
+  return `${part('year')}-${part('month')}-${part('day')}`;
+}
+
+// Create a UTC calendar-day anchor. We use it for date arithmetic only.
+function dateKeyToAnchor(key) {
+  if (!key) return null;
+
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(key);
+  if (!match) return null;
+
+  const [, year, month, day] = match;
+  const anchor = new Date(
+    Date.UTC(Number(year), Number(month) - 1, Number(day))
+  );
+
+  if (
+    anchor.getUTCFullYear() !== Number(year) ||
+    anchor.getUTCMonth() + 1 !== Number(month) ||
+    anchor.getUTCDate() !== Number(day)
+  ) {
+    return null;
+  }
+
+  return anchor;
+}
+
+function addDays(date, days) {
   const result = new Date(date);
-  result.setHours(0, 0, 0, 0);
-
-  const day = result.getDay();
-  const difference = day === 0 ? -6 : 1 - day;
-
-  result.setDate(result.getDate() + difference);
+  result.setUTCDate(result.getUTCDate() + days);
   return result;
 }
 
-function isValidDate(value) {
-  return value != null && !Number.isNaN(new Date(value).getTime());
+function getMonday(date) {
+  const todayKey = getDateKey(date);
+  const anchor = dateKeyToAnchor(todayKey) || new Date();
+
+  // UTC weekday: Sunday = 0, Monday = 1, ... Saturday = 6.
+  const weekday = anchor.getUTCDay();
+  const daysSinceMonday = weekday === 0 ? 6 : weekday - 1;
+
+  return addDays(anchor, -daysSinceMonday);
 }
 
 function formatDate(value) {
   if (!isValidDate(value)) return 'Date unavailable';
 
-  return new Date(value).toLocaleDateString('en-GB', {
+  return dateTimeFormatter.format(new Date(value));
+}
+
+function formatCalendarDate(value) {
+  if (!(value instanceof Date) || Number.isNaN(value.getTime())) {
+    return 'Date unavailable';
+  }
+
+  // The supplied Date represents a calendar-day anchor, not a match timestamp.
+  const key = [
+    value.getUTCFullYear(),
+    String(value.getUTCMonth() + 1).padStart(2, '0'),
+    String(value.getUTCDate()).padStart(2, '0'),
+  ].join('-');
+
+  const anchor = dateKeyToAnchor(key);
+  if (!anchor) return 'Date unavailable';
+
+  return new Intl.DateTimeFormat('en-GB', {
+    timeZone: 'UTC',
     weekday: 'long',
     day: 'numeric',
     month: 'long',
     year: 'numeric',
-  });
+  }).format(anchor);
 }
 
 function formatTime(value) {
   if (!isValidDate(value)) return 'Time unavailable';
 
-  return new Date(value).toLocaleTimeString('en-GB', {
-    hour: '2-digit',
-    minute: '2-digit',
-  });
+  return timeFormatter.format(new Date(value));
 }
 
 function getConfidence(prediction) {
   const value = Number(prediction?.confidenceScore);
+
+  if (
+    prediction?.confidenceScore === null ||
+    prediction?.confidenceScore === undefined ||
+    prediction?.confidenceScore === ''
+  ) {
+    return null;
+  }
 
   if (!Number.isFinite(value)) return null;
 
@@ -65,6 +157,7 @@ function getMatchId(prediction, index) {
   return (
     prediction?.fixtureId ??
     prediction?.id ??
+    prediction?._id ??
     `${prediction?.homeTeam || 'home'}-${prediction?.awayTeam || 'away'}-${prediction?.date || index}`
   );
 }
@@ -74,27 +167,94 @@ function getStatus(prediction) {
 }
 
 function getStatusClasses(status) {
-  if (['LIVE', 'IN PLAY', '1ST HALF', '2ND HALF', 'HT'].includes(status)) {
+  if (
+    ['LIVE', 'IN PLAY', '1ST HALF', '2ND HALF', 'HT', 'PAUSED'].includes(status)
+  ) {
     return 'bg-red-900 text-red-300';
   }
 
-  if (['FT', 'AET', 'PEN', 'FINISHED'].includes(status)) {
+  if (
+    ['FT', 'AET', 'PEN', 'FINISHED', 'CANCELLED', 'POSTPONED'].includes(status)
+  ) {
     return 'bg-gray-700 text-gray-300';
   }
 
   return 'bg-emerald-900 text-emerald-300';
 }
 
+// Support both market formats:
+// 1. [{ market, selection, probability }]
+// 2. { matchWinner: { home, draw, away }, overUnder25: { over, under }, ... }
 function getMarkets(prediction) {
-  return Array.isArray(prediction?.allMarkets)
-    ? prediction.allMarkets.filter(
-        (market) =>
-          market &&
-          market.market &&
-          market.selection &&
-          Number.isFinite(Number(market.probability))
-      )
-    : [];
+  const raw = prediction?.allMarkets;
+
+  if (Array.isArray(raw)) {
+    return raw.filter(
+      (market) =>
+        market &&
+        market.market &&
+        market.selection &&
+        market.probability !== null &&
+        market.probability !== undefined &&
+        market.probability !== '' &&
+        Number.isFinite(Number(market.probability))
+    );
+  }
+
+  if (!raw || typeof raw !== 'object') return [];
+
+  const marketNames = {
+    matchWinner: 'Match Winner',
+    overUnder15: 'Over/Under 1.5 Goals',
+    overUnder25: 'Over/Under 2.5 Goals',
+    overUnder35: 'Over/Under 3.5 Goals',
+    bothTeamsToScore: 'Both Teams to Score',
+    doubleChance: 'Double Chance',
+    drawNoBet: 'Draw No Bet',
+    correctScore: 'Correct Score',
+  };
+
+  const selectionNames = {
+    home: prediction?.homeTeam || 'Home',
+    draw: 'Draw',
+    away: prediction?.awayTeam || 'Away',
+    over: 'Over',
+    under: 'Under',
+    yes: 'Yes',
+    no: 'No',
+    homeOrDraw: 'Home or Draw',
+    homeOrAway: 'Home or Away',
+    drawOrAway: 'Draw or Away',
+  };
+
+  const result = [];
+
+  for (const [marketKey, outcomes] of Object.entries(raw)) {
+    if (!outcomes || typeof outcomes !== 'object' || Array.isArray(outcomes)) {
+      continue;
+    }
+
+    for (const [outcomeKey, probability] of Object.entries(outcomes)) {
+      if (
+        probability === null ||
+        probability === undefined ||
+        probability === '' ||
+        !Number.isFinite(Number(probability))
+      ) {
+        continue;
+      }
+
+      result.push({
+        market: marketNames[marketKey] || marketKey,
+        selection:
+          selectionNames[outcomeKey] ||
+          outcomeKey.replace(/([A-Z])/g, ' $1'),
+        probability: Number(probability),
+      });
+    }
+  }
+
+  return result;
 }
 
 function isValueOpportunity(prediction) {
@@ -102,11 +262,11 @@ function isValueOpportunity(prediction) {
     prediction?.bestMarketString || ''
   ).toLowerCase();
 
-  const marketDescriptions = getMarkets(prediction)
-    .map((market) => `${market.market} ${market.selection}`.toLowerCase())
-    .join(' ');
-
-  const combined = `${description} ${marketDescriptions}`;
+  const markets = getMarkets(prediction);
+  const combined = [
+    description,
+    ...markets.map((market) => `${market.market} ${market.selection}`.toLowerCase()),
+  ].join(' ');
 
   return (
     combined.includes('over') ||
@@ -116,18 +276,24 @@ function isValueOpportunity(prediction) {
 }
 
 function normalizePredictions(responseData) {
-  // Accept the API format used by this project.
-  if (Array.isArray(responseData?.predictions)) {
-    return responseData.predictions;
+  const list = Array.isArray(responseData?.predictions)
+    ? responseData.predictions
+    : Array.isArray(responseData)
+      ? responseData
+      : null;
+
+  if (!list) {
+    throw new Error(
+      'The server response does not contain a valid predictions list.'
+    );
   }
 
-  // Also support APIs that return the array directly.
-  if (Array.isArray(responseData)) {
-    return responseData;
-  }
-
-  throw new Error(
-    'The server response does not contain a valid predictions list.'
+  return list.filter(
+    (item) =>
+      item &&
+      typeof item === 'object' &&
+      isValidDate(item.date) &&
+      String(item.sport || 'football').toLowerCase() !== ''
   );
 }
 
@@ -158,9 +324,7 @@ export default function Dashboard({
         `${API_BASE_URL}/api/predictions`,
         {
           timeout: 20000,
-          headers: {
-            Accept: 'application/json',
-          },
+          headers: { Accept: 'application/json' },
         }
       );
 
@@ -170,19 +334,19 @@ export default function Dashboard({
       setLastUpdated(new Date());
       setErrorMessage('');
 
-      // Keep the selected match synchronized with the latest response.
       setSelectedMatch((previous) => {
         if (!previous) return null;
 
         const previousId = String(
-          previous.fixtureId ?? previous.id ?? ''
+          previous.fixtureId ?? previous.id ?? previous._id ?? ''
         );
 
         return (
           receivedPredictions.find(
             (prediction) =>
-              String(prediction.fixtureId ?? prediction.id ?? '') ===
-              previousId
+              String(
+                prediction.fixtureId ?? prediction.id ?? prediction._id ?? ''
+              ) === previousId
           ) || previous
         );
       });
@@ -224,7 +388,7 @@ export default function Dashboard({
     if (pageFilter === 'football') {
       results = results.filter(
         (prediction) =>
-          String(prediction.sport || '').toLowerCase() === 'football'
+          String(prediction.sport || 'football').toLowerCase() === 'football'
       );
     } else if (pageFilter === 'basketball') {
       results = results.filter(
@@ -232,19 +396,11 @@ export default function Dashboard({
           String(prediction.sport || '').toLowerCase() === 'basketball'
       );
     } else if (pageFilter === 'today') {
-      const today = new Date();
+      const todayKey = getDateKey(new Date());
 
-      results = results.filter((prediction) => {
-        if (!isValidDate(prediction.date)) return false;
-
-        const matchDate = new Date(prediction.date);
-
-        return (
-          matchDate.getFullYear() === today.getFullYear() &&
-          matchDate.getMonth() === today.getMonth() &&
-          matchDate.getDate() === today.getDate()
-        );
-      });
+      results = results.filter(
+        (prediction) => getDateKey(prediction.date) === todayKey
+      );
     } else if (pageFilter === 'value') {
       results = results.filter(isValueOpportunity);
     }
@@ -269,76 +425,63 @@ export default function Dashboard({
 
     if (pageFilter === 'motd') {
       results.sort(
-        (a, b) =>
-          (getConfidence(b) ?? -1) - (getConfidence(a) ?? -1)
+        (a, b) => (getConfidence(b) ?? -1) - (getConfidence(a) ?? -1)
       );
-
       results = results.slice(0, 1);
     }
 
     return results;
   }, [predictions, pageFilter, searchQuery]);
 
-  const weekEnd = useMemo(() => {
-    const result = new Date(currentWeekStart);
-    result.setDate(result.getDate() + 7);
-    return result;
-  }, [currentWeekStart]);
-
   const weekMatches = useMemo(() => {
-    // Today's Matches should show today's fixtures, not an entire week.
-    if (pageFilter === 'today') {
+    if (pageFilter === 'today' || pageFilter === 'motd' || pageFilter === 'value') {
       return filteredPredictions;
     }
 
+    const startKey = [
+      currentWeekStart.getUTCFullYear(),
+      String(currentWeekStart.getUTCMonth() + 1).padStart(2, '0'),
+      String(currentWeekStart.getUTCDate()).padStart(2, '0'),
+    ].join('-');
+
+    const endAnchor = addDays(currentWeekStart, 7);
+    const endKey = [
+      endAnchor.getUTCFullYear(),
+      String(endAnchor.getUTCMonth() + 1).padStart(2, '0'),
+      String(endAnchor.getUTCDate()).padStart(2, '0'),
+    ].join('-');
+
     return filteredPredictions.filter((prediction) => {
-      if (!isValidDate(prediction.date)) return false;
-
-      const matchDate = new Date(prediction.date);
-
-      return (
-        matchDate >= currentWeekStart &&
-        matchDate < weekEnd
-      );
+      const key = getDateKey(prediction.date);
+      return key && key >= startKey && key < endKey;
     });
-  }, [
-    filteredPredictions,
-    currentWeekStart,
-    weekEnd,
-    pageFilter,
-  ]);
+  }, [filteredPredictions, currentWeekStart, pageFilter]);
 
   const groupedMatches = useMemo(() => {
     const groups = {};
 
     DAYS_OF_WEEK.forEach((dayName, index) => {
-      const dayDate = new Date(currentWeekStart);
-      dayDate.setDate(dayDate.getDate() + index);
+      const dayDate = addDays(currentWeekStart, index);
+      const dayKey = [
+        dayDate.getUTCFullYear(),
+        String(dayDate.getUTCMonth() + 1).padStart(2, '0'),
+        String(dayDate.getUTCDate()).padStart(2, '0'),
+      ].join('-');
 
       const dayMatches = weekMatches
-        .filter((prediction) => {
-          if (!isValidDate(prediction.date)) return false;
-
-          const matchDate = new Date(prediction.date);
-
-          return (
-            matchDate.getFullYear() === dayDate.getFullYear() &&
-            matchDate.getMonth() === dayDate.getMonth() &&
-            matchDate.getDate() === dayDate.getDate()
-          );
-        })
+        .filter((prediction) => getDateKey(prediction.date) === dayKey)
         .sort(
           (a, b) =>
-            new Date(a.date).getTime() -
-            new Date(b.date).getTime()
+            new Date(a.date).getTime() - new Date(b.date).getTime()
         );
 
       groups[dayName] = {
         date: dayDate,
+        dateKey: dayKey,
         matches: dayMatches,
         football: dayMatches.filter(
           (prediction) =>
-            String(prediction.sport || '').toLowerCase() === 'football'
+            String(prediction.sport || 'football').toLowerCase() === 'football'
         ),
         basketball: dayMatches.filter(
           (prediction) =>
@@ -351,21 +494,20 @@ export default function Dashboard({
   }, [weekMatches, currentWeekStart]);
 
   const changeWeek = (numberOfWeeks) => {
-    setCurrentWeekStart((previous) => {
-      const result = new Date(previous);
-      result.setDate(result.getDate() + numberOfWeeks * 7);
-      return result;
-    });
+    setCurrentWeekStart((previous) =>
+      addDays(previous, numberOfWeeks * 7)
+    );
   };
 
   const isToday = (date) => {
-    const today = new Date();
+    const todayKey = getDateKey(new Date());
+    const key = [
+      date.getUTCFullYear(),
+      String(date.getUTCMonth() + 1).padStart(2, '0'),
+      String(date.getUTCDate()).padStart(2, '0'),
+    ].join('-');
 
-    return (
-      date.getFullYear() === today.getFullYear() &&
-      date.getMonth() === today.getMonth() &&
-      date.getDate() === today.getDate()
-    );
+    return key === todayKey;
   };
 
   const renderMatchCard = (prediction, index) => {
@@ -380,10 +522,7 @@ export default function Dashboard({
         ? `${markets[0].market}: ${markets[0].selection}`
         : 'No market supplied by the server');
 
-    const actualScore =
-      prediction.actualScore ??
-      prediction.score ??
-      null;
+    const actualScore = prediction.actualScore ?? prediction.score ?? null;
 
     return (
       <button
@@ -464,13 +603,18 @@ export default function Dashboard({
         <p className="text-xs text-gray-500 mt-3">
           {formatDate(prediction.date)}
         </p>
+
+        {String(prediction.dataQuality || '').toUpperCase().includes('LOW') && (
+          <p className="text-xs text-amber-400 mt-3">
+            Caution: limited data quality. This estimate is not fully verified.
+          </p>
+        )}
       </button>
     );
   };
 
   const renderDaySection = (dayName) => {
     const dayData = groupedMatches[dayName];
-
     if (!dayData) return null;
 
     const showFootball = pageFilter !== 'basketball';
@@ -479,11 +623,9 @@ export default function Dashboard({
     return (
       <section key={dayName}>
         <h3 className="text-xl font-semibold mb-6 border-l-4 border-emerald-500 pl-3">
-          {dayName} — {formatDate(dayData.date)}
+          {dayName} — {formatCalendarDate(dayData.date)}
           {isToday(dayData.date) && (
-            <span className="ml-2 text-xs text-emerald-400">
-              TODAY
-            </span>
+            <span className="ml-2 text-xs text-emerald-400">TODAY</span>
           )}
         </h3>
 
@@ -542,6 +684,9 @@ export default function Dashboard({
     motd: 'MATCH OF THE DAY',
     value: 'VALUE OPPORTUNITIES',
   }[pageFilter] || 'MATCH FIXTURES & AI PREDICTIONS';
+
+  const weekStartLabel = formatCalendarDate(currentWeekStart);
+  const weekEndLabel = formatCalendarDate(addDays(currentWeekStart, 6));
 
   return (
     <div className="min-h-screen bg-gray-900 text-white">
@@ -651,7 +796,7 @@ export default function Dashboard({
 
               {lastUpdated && (
                 <span className="block text-xs text-gray-500 mt-1">
-                  Updated {lastUpdated.toLocaleTimeString()}
+                  Updated {formatTime(lastUpdated)}
                 </span>
               )}
             </div>
@@ -696,11 +841,9 @@ export default function Dashboard({
           <div className="text-center min-w-0">
             <p className="text-sm text-gray-400">Selected week</p>
             <p className="font-bold text-emerald-400 text-sm sm:text-base">
-              {formatDate(currentWeekStart)}
+              {weekStartLabel}
             </p>
-            <p className="text-xs text-gray-500">
-              to {formatDate(new Date(weekEnd.getTime() - 86400000))}
-            </p>
+            <p className="text-xs text-gray-500">to {weekEndLabel}</p>
           </div>
 
           <button
@@ -763,8 +906,8 @@ export default function Dashboard({
         )}
 
         <footer className="mt-12 border-t border-gray-800 pt-5 pb-6 text-center text-xs text-gray-500">
-          Match Intelligence AI · Predictions depend on the data returned by
-          the connected providers.
+          Match Intelligence AI · Match times are shown in Ghana time.
+          Predictions depend on the data returned by the connected providers.
         </footer>
       </main>
 
@@ -804,8 +947,7 @@ export default function Dashboard({
               </h2>
 
               <p className="text-gray-400 text-sm mt-2">
-                {formatDate(selectedMatch.date)} ·{' '}
-                {formatTime(selectedMatch.date)}
+                {formatDate(selectedMatch.date)} · {formatTime(selectedMatch.date)}
               </p>
 
               <p className="text-xs text-gray-500 mt-1">
@@ -892,10 +1034,22 @@ export default function Dashboard({
                 {selectedMatch.aiExplanation ||
                   'No tactical explanation was supplied by the backend for this match.'}
               </p>
+
+              {selectedMatch.dataQuality && (
+                <p className="text-xs text-amber-400 mt-3">
+                  Data quality: {selectedMatch.dataQuality}
+                </p>
+              )}
+
+              {selectedMatch.recommendation && (
+                <p className="text-sm text-gray-300 mt-3">
+                  {selectedMatch.recommendation}
+                </p>
+              )}
             </div>
 
             <div className="mt-4 text-xs text-gray-500">
-              Confidence is an estimate, not a guarantee of the outcome.
+              Probabilities are estimates, not guarantees of match outcomes.
             </div>
           </div>
         </div>
