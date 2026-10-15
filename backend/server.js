@@ -1,3 +1,4 @@
+'use strict';
 
 require('dotenv').config();
 
@@ -6,28 +7,31 @@ const cors = require('cors');
 const axios = require('axios');
 const cron = require('node-cron');
 const mongoose = require('mongoose');
+const crypto = require('crypto');
 
 const app = express();
 
 app.use(cors({ origin: '*' }));
 app.use(express.json({ limit: '1mb' }));
 
-// ==================================================
-// 1. CONFIGURATION — FOOTBALL ONLY
-// ==================================================
-
-const PORT = process.env.PORT || 5001;
+const PORT = Number(process.env.PORT) || 5001;
 const MONGO_URI = process.env.MONGO_URI;
 const FOOTBALL_DATA_API_KEY = process.env.FOOTBALL_DATA_API_KEY;
 const SPORTMONKS_API_TOKEN = process.env.SPORTMONKS_API_TOKEN;
+const ADMIN_API_KEY = process.env.ADMIN_API_KEY;
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 
 const FOOTBALL_LIMIT = Math.max(
   1,
   Math.min(20, Number(process.env.FOOTBALL_DAILY_LIMIT) || 20)
 );
 
-// Request the next seven days of fixtures.
-const DAYS_AHEAD = 7;
+const DAYS_AHEAD = Math.max(
+  1,
+  Math.min(14, Number(process.env.DAYS_AHEAD) || 7)
+);
+
 const REQUEST_TIMEOUT_MS = 15000;
 
 const footballApi = axios.create({
@@ -38,11 +42,19 @@ const footballApi = axios.create({
   }
 });
 
-// ==================================================
-// 2. DATABASE SCHEMAS
-// ==================================================
+const sportmonksApi = axios.create({
+  baseURL: 'https://api.sportmonks.com/v3/football',
+  timeout: REQUEST_TIMEOUT_MS,
+  headers: SPORTMONKS_API_TOKEN
+    ? { Authorization: SPORTMONKS_API_TOKEN }
+    : {}
+});
 
-const PredictionSchema = new mongoose.Schema({
+// ============================================================
+// DATABASE MODELS
+// ============================================================
+
+const predictionSchema = new mongoose.Schema({
   fixtureId: {
     type: String,
     required: true,
@@ -53,45 +65,38 @@ const PredictionSchema = new mongoose.Schema({
   sport: {
     type: String,
     default: 'football',
-    required: true,
     index: true
   },
 
   league: String,
-  homeTeam: String,
-  awayTeam: String,
-  homeTeamId: Number,
-  awayTeamId: Number,
+  homeTeam: { type: String, required: true },
+  awayTeam: { type: String, required: true },
 
-  date: {
-    type: Date,
-    index: true
-  },
+  homeTeamId: mongoose.Schema.Types.Mixed,
+  awayTeamId: mongoose.Schema.Types.Mixed,
+
+  date: { type: Date, index: true },
 
   status: {
     type: String,
-    default: 'Scheduled',
+    default: 'SCHEDULED',
     index: true
   },
 
-  actualScore: String,
+  actualScore: mongoose.Schema.Types.Mixed,
   predictedWinner: String,
 
   isFinished: {
     type: Boolean,
-    default: false
+    default: false,
+    index: true
   },
 
-  isCorrect: {
-    type: Boolean,
-    default: null
-  },
-
-  allMarkets: Array,
+  isCorrect: Boolean,
+  allMarkets: mongoose.Schema.Types.Mixed,
   bestMarketString: String,
-  topCorrectScores: Array,
-
-  confidenceScore: String,
+  topCorrectScores: [mongoose.Schema.Types.Mixed],
+  confidenceScore: Number,
   dataQuality: String,
   recommendation: String,
   predictedScore: String,
@@ -99,54 +104,75 @@ const PredictionSchema = new mongoose.Schema({
 
   modelVersion: {
     type: String,
-    default: 'football-baseline-v20'
+    default: 'football-data-form-v21'
   },
+
+  source: String,
+  sourceData: mongoose.Schema.Types.Mixed,
 
   lastUpdated: {
     type: Date,
     default: Date.now
   }
-}, { timestamps: true });
+}, {
+  timestamps: true,
+  minimize: false
+});
 
-const Prediction = mongoose.model(
-  'Prediction',
-  PredictionSchema
-);
-
-const HistorySchema = new mongoose.Schema({
-  fixtureId: String,
-  sport: String,
+const historySchema = new mongoose.Schema({
+  fixtureId: { type: String, index: true },
+  sport: { type: String, default: 'football' },
   league: String,
   homeTeam: String,
   awayTeam: String,
-  homeTeamId: Number,
-  awayTeamId: Number,
   date: Date,
   status: String,
-  actualScore: String,
+  actualScore: mongoose.Schema.Types.Mixed,
   predictedWinner: String,
-  isFinished: Boolean,
   isCorrect: Boolean,
-  allMarkets: Array,
+  allMarkets: mongoose.Schema.Types.Mixed,
   bestMarketString: String,
-  topCorrectScores: Array,
-  confidenceScore: String,
+  confidenceScore: Number,
   dataQuality: String,
-  recommendation: String,
-  predictedScore: String,
-  aiExplanation: String,
   modelVersion: String,
-  errorDiagnosis: String
-}, { timestamps: true });
+  errorDiagnosis: String,
 
-const History = mongoose.model('History', HistorySchema);
+  settledAt: {
+    type: Date,
+    default: Date.now
+  }
+}, {
+  timestamps: true,
+  minimize: false
+});
 
-// ==================================================
-// 3. GENERAL HELPERS
-// ==================================================
+const Prediction = mongoose.models.Prediction ||
+  mongoose.model('Prediction', predictionSchema);
+
+const History = mongoose.models.History ||
+  mongoose.model('History', historySchema);
+
+// ============================================================
+// APPLICATION STATE
+// ============================================================
+
+let refreshInProgress = false;
+let lastCycle = null;
+let lastCycleError = null;
+
+let lastProviderStatus = {
+  footballData: 'not_checked',
+  sportmonks: 'not_checked'
+};
+
+const recentFormCache = new Map();
+
+// ============================================================
+// GENERAL HELPERS
+// ============================================================
 
 function formatDateUTC(date) {
-  return date.toISOString().slice(0, 10);
+  return new Date(date).toISOString().slice(0, 10);
 }
 
 function addDays(date, days) {
@@ -155,24 +181,107 @@ function addDays(date, days) {
   return result;
 }
 
-function isValidDate(value) {
-  return Boolean(
-    value && !Number.isNaN(new Date(value).getTime())
-  );
-}
-
 function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
 }
 
-// ==================================================
-// 4. FOOTBALL-DATA.ORG CONNECTION
-// ==================================================
+function normalizeName(value) {
+  return String(value || '')
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/\b(fc|cf|sc|afc|ac|club|football|women|wfc)\b/g, '')
+    .replace(/[^a-z0-9]/g, '');
+}
+
+function safeNumber(value, fallback = 0) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : fallback;
+}
+
+function poisson(lambda, goals) {
+  let factorial = 1;
+
+  for (let i = 2; i <= goals; i++) {
+    factorial *= i;
+  }
+
+  return (
+    Math.exp(-lambda) *
+    Math.pow(lambda, goals)
+  ) / factorial;
+}
+
+// ============================================================
+// RECENT-FORM CALCULATIONS
+// ============================================================
+
+function teamScoreFromRecentMatches(teamId, recentMatches) {
+  if (!Array.isArray(recentMatches) || !recentMatches.length) {
+    return null;
+  }
+
+  let points = 0;
+  let goalsFor = 0;
+  let goalsAgainst = 0;
+  let played = 0;
+
+  for (const match of recentMatches) {
+    const homeId = String(match.homeTeamId ?? '');
+    const awayId = String(match.awayTeamId ?? '');
+    const target = String(teamId ?? '');
+
+    const homeGoals = Number(match.homeGoals);
+    const awayGoals = Number(match.awayGoals);
+
+    if (
+      !Number.isFinite(homeGoals) ||
+      !Number.isFinite(awayGoals)
+    ) {
+      continue;
+    }
+
+    if (homeId !== target && awayId !== target) {
+      continue;
+    }
+
+    const isHome = homeId === target;
+
+    const scored = isHome ? homeGoals : awayGoals;
+    const conceded = isHome ? awayGoals : homeGoals;
+
+    goalsFor += scored;
+    goalsAgainst += conceded;
+
+    if (scored > conceded) {
+      points += 3;
+    } else if (scored === conceded) {
+      points += 1;
+    }
+
+    played++;
+  }
+
+  if (!played) {
+    return null;
+  }
+
+  return {
+    played,
+    pointsPerGame: points / played,
+    goalsFor: goalsFor / played,
+    goalsAgainst: goalsAgainst / played
+  };
+}
+
+// ============================================================
+// FOOTBALL-DATA.ORG FIXTURES
+// ============================================================
 
 async function fetchFootballFixtures(from, to) {
   if (!FOOTBALL_DATA_API_KEY) {
     throw new Error(
-      'FOOTBALL_DATA_API_KEY is missing from the environment.'
+      'FOOTBALL_DATA_API_KEY is not configured'
     );
   }
 
@@ -183,483 +292,927 @@ async function fetchFootballFixtures(from, to) {
     }
   });
 
-  const matches = response.data?.matches;
+  lastProviderStatus.footballData = 'ok';
 
-  if (!Array.isArray(matches)) {
-    throw new Error(
-      'Football provider returned an unexpected response structure.'
-    );
-  }
-
-  return matches;
+  return Array.isArray(response.data?.matches)
+    ? response.data.matches
+    : [];
 }
 
-// ==================================================
-// 5. BASELINE PREDICTION ENGINE
-// IMPORTANT:
-// This is a basic placeholder model. It does not use
-// verified form, injuries, lineups, or team statistics.
-// ==================================================
+// ============================================================
+// OPTIONAL SPORTMONKS FIXTURE ENRICHMENT
+// ============================================================
 
-class PredictionEngine {
-  hashStrength(id) {
-    let hash = Number(id) || 1;
-
-    for (let i = 0; i < 3; i++) {
-      hash = (hash * 31) % 1000;
-    }
-
-    return 0.3 + (hash / 1000) * 0.7;
+async function fetchSportmonksFixtures(from, to) {
+  if (!SPORTMONKS_API_TOKEN) {
+    return [];
   }
 
-  factorial(n) {
-    if (n < 0) return 0;
-    if (n === 0) return 1;
-
-    let result = 1;
-
-    for (let i = 2; i <= n; i++) {
-      result *= i;
-    }
-
-    return result;
-  }
-
-  poisson(expected, actual) {
-    return (
-      Math.pow(expected, actual) *
-      Math.exp(-expected) /
-      this.factorial(actual)
+  try {
+    const response = await sportmonksApi.get(
+      `/fixtures/between/${from}/${to}`,
+      {
+        params: {
+          include: 'participants;scores;league;statistics',
+          per_page: 50
+        }
+      }
     );
+
+    lastProviderStatus.sportmonks = 'ok';
+
+    return Array.isArray(response.data?.data)
+      ? response.data.data
+      : [];
+  } catch (error) {
+    lastProviderStatus.sportmonks =
+      `error_${error.response?.status || 'request'}`;
+
+    console.warn(
+      '[SPORTMONKS] Optional fixture enrichment unavailable:',
+      error.response?.status || error.message
+    );
+
+    return [];
+  }
+}
+
+function sportmonksParticipants(fixture) {
+  const participants = Array.isArray(fixture?.participants)
+    ? fixture.participants
+    : [];
+
+  let home = null;
+  let away = null;
+
+  for (const participant of participants) {
+    const location = participant?.meta?.location;
+
+    if (location === 'home') home = participant;
+    if (location === 'away') away = participant;
   }
 
-  analyzeFootball(match) {
+  return { home, away };
+}
+
+function mapSportmonksFixtures(fixtures) {
+  const map = new Map();
+
+  for (const fixture of fixtures) {
+    const { home, away } = sportmonksParticipants(fixture);
+
+    if (!home?.name || !away?.name) {
+      continue;
+    }
+
+    const key =
+      `${normalizeName(home.name)}|${normalizeName(away.name)}`;
+
+    map.set(key, fixture);
+  }
+
+  return map;
+}
+
+function getScoreFromSportmonks(fixture) {
+  const scores = Array.isArray(fixture?.scores)
+    ? fixture.scores
+    : [];
+
+  let home = null;
+  let away = null;
+
+  for (const item of scores) {
+    const description =
+      String(item?.description || '').toLowerCase();
+
+    const score = item?.score?.goals;
+    const location = item?.score?.participant;
+
     if (
-      !match.fixtureId ||
-      !match.homeTeam?.name ||
-      !match.awayTeam?.name
+      description.includes('current') ||
+      description.includes('2nd half') ||
+      description.includes('fulltime')
     ) {
-      throw new Error('Invalid football fixture.');
-    }
-
-    const homeStrength =
-      this.hashStrength(match.homeTeam.id) + 0.15;
-
-    const awayStrength =
-      this.hashStrength(match.awayTeam.id);
-
-    const totalStrength = homeStrength + awayStrength;
-
-    const drawProbability = clamp(
-      0.28 -
-      (Math.abs(homeStrength - awayStrength) /
-        totalStrength) * 0.2,
-      0.15,
-      0.30
-    );
-
-    const homeProbability =
-      (homeStrength / totalStrength) *
-      (1 - drawProbability);
-
-    const awayProbability =
-      (awayStrength / totalStrength) *
-      (1 - drawProbability);
-
-    const homeGoals = Math.max(
-      0.15,
-      (0.5 + homeStrength * 2) *
-      (2 - awayStrength) / 1.4
-    );
-
-    const awayGoals = Math.max(
-      0.15,
-      (0.5 + awayStrength * 2) *
-      (2 - homeStrength) / 1.4
-    );
-
-    const markets = [
-      {
-        market: 'Match Winner',
-        selection: match.homeTeam.name,
-        probability: homeProbability
-      },
-      {
-        market: 'Match Winner',
-        selection: 'Draw',
-        probability: drawProbability
-      },
-      {
-        market: 'Match Winner',
-        selection: match.awayTeam.name,
-        probability: awayProbability
+      if (location === 'home') {
+        home = safeNumber(score, home);
       }
-    ];
 
-    const totalGoals = homeGoals + awayGoals;
-
-    const probabilityUnderOneGoal =
-      this.poisson(totalGoals, 0);
-
-    const probabilityExactlyOneGoal =
-      this.poisson(totalGoals, 1);
-
-    markets.push({
-      market: 'Over/Under 1.5 Goals',
-      selection: 'Over 1.5',
-      probability: clamp(
-        1 -
-        probabilityUnderOneGoal -
-        probabilityExactlyOneGoal,
-        0,
-        1
-      )
-    });
-
-    const bestMarket = markets.reduce(
-      (best, current) =>
-        current.probability > best.probability
-          ? current
-          : best
-    );
-
-    const correctScores = [];
-
-    for (let home = 0; home <= 5; home++) {
-      for (let away = 0; away <= 5; away++) {
-        correctScores.push({
-          score: `${home}-${away}`,
-          probability:
-            this.poisson(homeGoals, home) *
-            this.poisson(awayGoals, away)
-        });
+      if (location === 'away') {
+        away = safeNumber(score, away);
       }
     }
-
-    correctScores.sort(
-      (a, b) => b.probability - a.probability
-    );
-
-    return {
-      fixtureId: match.fixtureId,
-      sport: 'football',
-      league: match.league,
-      homeTeam: match.homeTeam.name,
-      awayTeam: match.awayTeam.name,
-      homeTeamId: match.homeTeam.id,
-      awayTeamId: match.awayTeam.id,
-      date: new Date(match.date),
-      status: 'Scheduled',
-
-      allMarkets: markets.map(market => ({
-        ...market,
-        probability: (
-          market.probability * 100
-        ).toFixed(1)
-      })),
-
-      bestMarketString:
-        `${bestMarket.market} (${bestMarket.selection})`,
-
-      topCorrectScores: correctScores
-        .slice(0, 5)
-        .map(item => ({
-          score: item.score,
-          probability: (
-            item.probability * 100
-          ).toFixed(1)
-        })),
-
-      predictedWinner:
-        homeProbability > awayProbability
-          ? match.homeTeam.name
-          : awayProbability > homeProbability
-            ? match.awayTeam.name
-            : 'Draw',
-
-      confidenceScore: (
-        bestMarket.probability * 100
-      ).toFixed(1),
-
-      dataQuality: 'LOW - BASELINE ONLY',
-
-      recommendation:
-        'BASELINE ONLY - VERIFY TEAM STATISTICS',
-
-      predictedScore:
-        `${Math.round(homeGoals)}-${Math.round(awayGoals)}`,
-
-      aiExplanation:
-        'This is a baseline estimate derived from team IDs. ' +
-        'It does not use verified recent form, injuries, ' +
-        'confirmed lineups, odds, or historical performance.',
-
-      modelVersion: 'football-baseline-v20'
-    };
   }
+
+  if (home !== null && away !== null) {
+    return { home, away };
+  }
+
+  return null;
 }
 
-const engine = new PredictionEngine();
+// ============================================================
+// PREDICTION ENGINE
+// ============================================================
 
-// ==================================================
-// 6. SAVE OR UPDATE A FOOTBALL FIXTURE
-// ==================================================
+function analyzeFootball(match, recentForm = {}) {
+  const homeForm = recentForm.home || null;
+  const awayForm = recentForm.away || null;
 
-async function saveFootballFixture(match) {
-  const fixtureId = match.id;
-  const date = match.utcDate;
-  const homeTeam = match.homeTeam;
-  const awayTeam = match.awayTeam;
-  const league = match.competition?.name || 'Unknown';
+  // General starting estimates; these are not live team statistics.
+  let homeLambda = 1.42;
+  let awayLambda = 1.12;
+
+  // Adjust estimates modestly when both teams have recent-form data.
+  if (homeForm && awayForm) {
+    const homeAttack = clamp(
+      homeForm.goalsFor / 1.35,
+      0.55,
+      1.65
+    );
+
+    const homeDefence = clamp(
+      homeForm.goalsAgainst / 1.25,
+      0.55,
+      1.65
+    );
+
+    const awayAttack = clamp(
+      awayForm.goalsFor / 1.15,
+      0.55,
+      1.65
+    );
+
+    const awayDefence = clamp(
+      awayForm.goalsAgainst / 1.35,
+      0.55,
+      1.65
+    );
+
+    homeLambda *=
+      0.65 * homeAttack + 0.35 * awayDefence;
+
+    awayLambda *=
+      0.65 * awayAttack + 0.35 * homeDefence;
+
+    homeLambda *= clamp(
+      1 + (
+        homeForm.pointsPerGame -
+        awayForm.pointsPerGame
+      ) * 0.035,
+      0.88,
+      1.12
+    );
+
+    awayLambda *= clamp(
+      1 + (
+        awayForm.pointsPerGame -
+        homeForm.pointsPerGame
+      ) * 0.035,
+      0.88,
+      1.12
+    );
+  }
+
+  const grid = [];
+
+  let homeWin = 0;
+  let draw = 0;
+  let awayWin = 0;
+  let over15 = 0;
+  let over25 = 0;
+  let btts = 0;
+
+  for (let homeGoals = 0; homeGoals <= 6; homeGoals++) {
+    for (let awayGoals = 0; awayGoals <= 6; awayGoals++) {
+      const probability =
+        poisson(homeLambda, homeGoals) *
+        poisson(awayLambda, awayGoals);
+
+      grid.push({
+        score: `${homeGoals}-${awayGoals}`,
+        home: homeGoals,
+        away: awayGoals,
+        probability
+      });
+
+      if (homeGoals > awayGoals) {
+        homeWin += probability;
+      } else if (homeGoals === awayGoals) {
+        draw += probability;
+      } else {
+        awayWin += probability;
+      }
+
+      if (homeGoals + awayGoals >= 2) {
+        over15 += probability;
+      }
+
+      if (homeGoals + awayGoals >= 3) {
+        over25 += probability;
+      }
+
+      if (homeGoals > 0 && awayGoals > 0) {
+        btts += probability;
+      }
+    }
+  }
+
+  const total = homeWin + draw + awayWin || 1;
+
+  homeWin /= total;
+  draw /= total;
+  awayWin /= total;
+
+  const choices = [
+    {
+      name: match.homeTeam,
+      probability: homeWin
+    },
+    {
+      name: 'Draw',
+      probability: draw
+    },
+    {
+      name: match.awayTeam,
+      probability: awayWin
+    }
+  ].sort((a, b) => b.probability - a.probability);
+
+  const confidenceScore = Math.round(
+    choices[0].probability * 100
+  );
+
+  const formAvailable = Boolean(homeForm && awayForm);
+
+  const topScores = grid
+    .sort((a, b) => b.probability - a.probability)
+    .slice(0, 5)
+    .map(item => ({
+      score: item.score,
+      probability: Math.round(
+        item.probability * 1000
+      ) / 10
+    }));
+
+  const markets = {
+    matchWinner: {
+      home: Math.round(homeWin * 1000) / 10,
+      draw: Math.round(draw * 1000) / 10,
+      away: Math.round(awayWin * 1000) / 10
+    },
+
+    overUnder15: {
+      over: Math.round(over15 * 1000) / 10,
+      under: Math.round((1 - over15) * 1000) / 10
+    },
+
+    overUnder25: {
+      over: Math.round(over25 * 1000) / 10,
+      under: Math.round((1 - over25) * 1000) / 10
+    },
+
+    bothTeamsToScore: {
+      yes: Math.round(btts * 1000) / 10,
+      no: Math.round((1 - btts) * 1000) / 10
+    }
+  };
+
+  const best = choices[0];
+
+  return {
+    predictedWinner: best.name,
+    confidenceScore,
+    allMarkets: markets,
+    bestMarketString:
+      `${best.name} ${confidenceScore}%`,
+    topCorrectScores: topScores,
+    predictedScore: topScores[0]?.score || '1-1',
+
+    dataQuality: formAvailable
+      ? 'MEDIUM - RECENT FORM AVAILABLE'
+      : 'LOW - FORM DATA UNAVAILABLE',
+
+    recommendation: confidenceScore >= 58
+      ? 'Consider only after reviewing team news and odds.'
+      : 'No strong winner edge; consider avoiding this market.',
+
+    aiExplanation: formAvailable
+      ? 'Poisson-based estimate using modest recent-form adjustments and a home advantage prior. It does not include verified injuries, confirmed lineups, bookmaker odds, or xG unless separately available.'
+      : 'Baseline Poisson estimate using general home advantage. Verified recent team form was unavailable, so confidence should be treated cautiously. This is not a guarantee.'
+  };
+}
+
+// ============================================================
+// LOAD RECENT MATCHES FOR EACH TEAM
+// ============================================================
+
+async function getRecentFormFromFootballData(
+  teamId,
+  from,
+  to
+) {
+  if (!FOOTBALL_DATA_API_KEY || !teamId) {
+    return null;
+  }
+
+  const cacheKey = `${teamId}:${from}:${to}`;
+  const cached = recentFormCache.get(cacheKey);
 
   if (
-    fixtureId == null ||
-    !isValidDate(date) ||
-    !homeTeam?.name ||
-    !awayTeam?.name ||
-    homeTeam.id == null ||
-    awayTeam.id == null
+    cached &&
+    Date.now() - cached.at < 6 * 60 * 60 * 1000
   ) {
-    return 'invalid';
+    return cached.value;
   }
 
-  // Keep new provider IDs separate from older records.
-  const databaseFixtureId = `fdorg_${fixtureId}`;
+  try {
+    const response = await footballApi.get(
+      `/teams/${teamId}/matches`,
+      {
+        params: {
+          dateFrom: from,
+          dateTo: to,
+          status: 'FINISHED',
+          limit: 10
+        }
+      }
+    );
 
-  const existing = await Prediction.findOne({
-    fixtureId: databaseFixtureId
-  }).lean();
+    const matches = (response.data?.matches || []).map(item => ({
+      homeTeamId: item.homeTeam?.id,
+      awayTeamId: item.awayTeam?.id,
+      homeGoals: item.score?.fullTime?.home,
+      awayGoals: item.score?.fullTime?.away
+    }));
 
-  // Do not replace a finished match's prediction.
-  if (existing?.isFinished) {
-    return 'finished';
+    const value = teamScoreFromRecentMatches(
+      teamId,
+      matches
+    );
+
+    recentFormCache.set(cacheKey, {
+      value,
+      at: Date.now()
+    });
+
+    return value;
+  } catch (error) {
+    console.warn(
+      `[FORM] Could not load recent form for team ${teamId}:`,
+      error.response?.status || error.message
+    );
+
+    return null;
   }
+}
 
-  const prediction = engine.analyzeFootball({
-    fixtureId: databaseFixtureId,
-    league,
-    date,
-    homeTeam: {
-      name: String(homeTeam.name),
-      id: Number(homeTeam.id)
+// ============================================================
+// SAVE AND UPDATE FIXTURE PREDICTIONS
+// ============================================================
+
+async function saveFootballFixture(match, smFixture = null) {
+  const homeId = match.homeTeam?.id;
+  const awayId = match.awayTeam?.id;
+  const now = new Date();
+  const date = new Date(match.utcDate);
+
+  const recentStart = formatDateUTC(
+    addDays(now, -60)
+  );
+
+  const recentEnd = formatDateUTC(now);
+
+  const [homeForm, awayForm] = await Promise.all([
+    getRecentFormFromFootballData(
+      homeId,
+      recentStart,
+      recentEnd
+    ),
+
+    getRecentFormFromFootballData(
+      awayId,
+      recentStart,
+      recentEnd
+    )
+  ]);
+
+  const result = analyzeFootball(
+    {
+      homeTeam: match.homeTeam?.name,
+      awayTeam: match.awayTeam?.name
     },
-    awayTeam: {
-      name: String(awayTeam.name),
-      id: Number(awayTeam.id)
+    {
+      home: homeForm,
+      away: awayForm
     }
-  });
+  );
+
+  const smScore = smFixture
+    ? getScoreFromSportmonks(smFixture)
+    : null;
+
+  const finished =
+    String(match.status || '').toUpperCase() === 'FINISHED';
+
+  const actualHome = match.score?.fullTime?.home;
+  const actualAway = match.score?.fullTime?.away;
+
+  const actualScore =
+    Number.isFinite(actualHome) &&
+    Number.isFinite(actualAway)
+      ? {
+          home: actualHome,
+          away: actualAway,
+          display: `${actualHome}-${actualAway}`
+        }
+      : smScore
+        ? {
+            home: smScore.home,
+            away: smScore.away,
+            display: `${smScore.home}-${smScore.away}`
+          }
+        : null;
+
+  const fixtureId = `fdorg_${match.id}`;
+
+  const document = {
+    fixtureId,
+    sport: 'football',
+
+    league: match.competition?.name || 'Football',
+
+    homeTeam: match.homeTeam?.name || 'Home team',
+    awayTeam: match.awayTeam?.name || 'Away team',
+
+    homeTeamId: homeId,
+    awayTeamId: awayId,
+
+    date: Number.isNaN(date.getTime()) ? null : date,
+    status: match.status || 'SCHEDULED',
+    actualScore,
+
+    predictedWinner: result.predictedWinner,
+    isFinished: finished,
+
+    allMarkets: result.allMarkets,
+    bestMarketString: result.bestMarketString,
+    topCorrectScores: result.topCorrectScores,
+    confidenceScore: result.confidenceScore,
+
+    dataQuality: result.dataQuality,
+    recommendation: result.recommendation,
+    predictedScore: result.predictedScore,
+    aiExplanation: result.aiExplanation,
+
+    modelVersion: 'football-data-form-v21',
+
+    source: smFixture
+      ? 'Football-Data.org + Sportmonks fixture match'
+      : 'Football-Data.org',
+
+    sourceData: smFixture
+      ? {
+          sportmonksFixtureId: smFixture.id,
+          sportmonksStatus:
+            smFixture.state || smFixture.status || null,
+
+          sportmonksHasStatistics:
+            Array.isArray(smFixture.statistics) &&
+            smFixture.statistics.length > 0,
+
+          sportmonksHasScores:
+            Array.isArray(smFixture.scores) &&
+            smFixture.scores.length > 0
+        }
+      : {
+          sportmonksMatched: false
+        },
+
+    lastUpdated: new Date()
+  };
+
+  const saved = await Prediction.findOneAndUpdate(
+    { fixtureId },
+    { $set: document },
+    {
+      upsert: true,
+      new: true,
+      setDefaultsOnInsert: true
+    }
+  );
+
+  if (finished && actualScore) {
+    await settlePrediction(saved);
+  }
+
+  return saved;
+}
+
+// ============================================================
+// RECORD COMPLETED MATCHES
+// ============================================================
+
+async function settlePrediction(prediction) {
+  if (
+    !prediction ||
+    !prediction.isFinished ||
+    !prediction.actualScore
+  ) {
+    return;
+  }
+
+  const score = prediction.actualScore;
+
+  const actualWinner =
+    score.home > score.away
+      ? prediction.homeTeam
+      : score.home < score.away
+        ? prediction.awayTeam
+        : 'Draw';
+
+  const isCorrect =
+    prediction.predictedWinner === actualWinner;
 
   await Prediction.updateOne(
-    {
-      fixtureId: databaseFixtureId,
-      isFinished: { $ne: true }
-    },
+    { _id: prediction._id },
     {
       $set: {
-        ...prediction,
-        date: new Date(date),
-        status: 'Scheduled',
-        lastUpdated: new Date()
-      },
-      $setOnInsert: {
-        isFinished: false,
-        isCorrect: null
+        isCorrect,
+        isFinished: true
+      }
+    }
+  );
+
+  await History.findOneAndUpdate(
+    { fixtureId: prediction.fixtureId },
+    {
+      $set: {
+        fixtureId: prediction.fixtureId,
+        sport: 'football',
+        league: prediction.league,
+
+        homeTeam: prediction.homeTeam,
+        awayTeam: prediction.awayTeam,
+        date: prediction.date,
+        status: prediction.status,
+
+        actualScore: score,
+        predictedWinner: prediction.predictedWinner,
+        isCorrect,
+
+        allMarkets: prediction.allMarkets,
+        bestMarketString: prediction.bestMarketString,
+        confidenceScore: prediction.confidenceScore,
+        dataQuality: prediction.dataQuality,
+        modelVersion: prediction.modelVersion,
+
+        errorDiagnosis: isCorrect
+          ? 'Correct match-winner prediction'
+          : `Predicted ${prediction.predictedWinner}; actual outcome ${actualWinner}`,
+
+        settledAt: new Date()
       }
     },
     {
       upsert: true,
-      runValidators: true
+      new: true
     }
   );
-
-  return existing ? 'updated' : 'inserted';
 }
 
-// ==================================================
-// 7. FOOTBALL-ONLY FIXTURE CYCLE
-// ==================================================
+// ============================================================
+// TELEGRAM NOTIFICATIONS
+// ============================================================
 
-let cycleRunning = false;
-
-async function runDailyCycle() {
-  if (cycleRunning) {
-    console.log(
-      '[CYCLE] Previous cycle is still running; skipping overlap.'
-    );
-    return;
+async function sendTelegramPredictions() {
+  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
+    return {
+      sent: false,
+      reason: 'Telegram not configured'
+    };
   }
-
-  if (mongoose.connection.readyState !== 1) {
-    console.error('[CYCLE] MongoDB is not connected.');
-    return;
-  }
-
-  if (!FOOTBALL_DATA_API_KEY) {
-    console.error(
-      '[CYCLE] FOOTBALL_DATA_API_KEY is missing.'
-    );
-    return;
-  }
-
-  cycleRunning = true;
-  const startedAt = Date.now();
 
   try {
-    console.log(
-      `[CYCLE] Starting football-only cycle at ${new Date().toISOString()}`
+    const upcoming = await Prediction.find({
+      sport: 'football',
+      isFinished: false,
+      date: { $gte: new Date() }
+    })
+      .sort({ confidenceScore: -1, date: 1 })
+      .limit(3)
+      .lean();
+
+    if (!upcoming.length) {
+      return {
+        sent: false,
+        reason: 'No upcoming predictions'
+      };
+    }
+
+    const lines = [
+      '⚽ Match Intelligence AI — Football predictions',
+      ''
+    ];
+
+    for (const item of upcoming) {
+      lines.push(
+        `${item.homeTeam} vs ${item.awayTeam}`
+      );
+
+      lines.push(
+        `Pick: ${item.predictedWinner} (${item.confidenceScore ?? 'N/A'}%)`
+      );
+
+      lines.push(
+        `Score estimate: ${item.predictedScore || 'N/A'} | Quality: ${item.dataQuality || 'Unknown'}`
+      );
+
+      lines.push(
+        item.date
+          ? new Date(item.date).toUTCString()
+          : 'Kickoff TBC',
+        ''
+      );
+    }
+
+    lines.push(
+      'Probabilities are estimates, not guarantees. Verify team news before acting.'
     );
 
-    const today = new Date();
-    const from = formatDateUTC(today);
+    await axios.post(
+      `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
+      {
+        chat_id: TELEGRAM_CHAT_ID,
+        text: lines.join('\n'),
+        disable_web_page_preview: true
+      },
+      {
+        timeout: REQUEST_TIMEOUT_MS
+      }
+    );
+
+    console.log('[TELEGRAM] Football predictions sent.');
+
+    return {
+      sent: true,
+      count: upcoming.length
+    };
+  } catch (error) {
+    console.warn(
+      '[TELEGRAM] Send failed:',
+      error.response?.status || error.message
+    );
+
+    return {
+      sent: false,
+      reason: 'Telegram send failed'
+    };
+  }
+}
+
+// ============================================================
+// AUTOMATIC FOOTBALL DATA REFRESH
+// ============================================================
+
+async function runDailyCycle() {
+  if (refreshInProgress) {
+    return {
+      skipped: true,
+      reason: 'Cycle already running'
+    };
+  }
+
+  refreshInProgress = true;
+  const started = Date.now();
+
+  try {
+    const from = formatDateUTC(new Date());
+
     const to = formatDateUTC(
-      addDays(today, DAYS_AHEAD - 1)
+      addDays(new Date(), DAYS_AHEAD)
+    );
+
+    console.log(
+      `[CYCLE] Starting football-only cycle ${new Date().toISOString()}`
     );
 
     console.log(
       `[FOOTBALL] Requesting fixtures from ${from} to ${to}.`
     );
 
-    const matches = await fetchFootballFixtures(from, to);
+    const [fixtures, smFixtures] = await Promise.all([
+      fetchFootballFixtures(from, to),
+      fetchSportmonksFixtures(from, to)
+    ]);
 
-    console.log(
-      `[FOOTBALL] Provider returned ${matches.length} matches.`
-    );
+    const smMap = mapSportmonksFixtures(smFixtures);
 
-    const now = Date.now();
+    const eligible = fixtures
+      .filter(item => {
+        const status = String(item.status || '').toUpperCase();
 
-    const eligible = matches
-      .filter(match =>
-        ['SCHEDULED', 'TIMED'].includes(match.status)
-      )
-      .filter(match => isValidDate(match.utcDate))
-      .filter(match =>
-        new Date(match.utcDate).getTime() >= now
-      )
-      .sort((a, b) =>
-        new Date(a.utcDate) - new Date(b.utcDate)
+        return (
+          ['SCHEDULED', 'TIMED', 'IN_PLAY', 'PAUSED'].includes(status) &&
+          new Date(item.utcDate) >= new Date()
+        );
+      })
+      .sort(
+        (a, b) => new Date(a.utcDate) - new Date(b.utcDate)
       )
       .slice(0, FOOTBALL_LIMIT);
 
     let inserted = 0;
     let updated = 0;
     let skipped = 0;
+    let settled = 0;
 
     for (const match of eligible) {
       try {
-        const result = await saveFootballFixture(match);
+        const key =
+          `${normalizeName(match.homeTeam?.name)}|${normalizeName(match.awayTeam?.name)}`;
 
-        if (result === 'inserted') {
-          inserted++;
-        } else if (result === 'updated') {
+        const before = await Prediction.exists({
+          fixtureId: `fdorg_${match.id}`
+        });
+
+        const saved = await saveFootballFixture(
+          match,
+          smMap.get(key) || null
+        );
+
+        if (before) {
           updated++;
         } else {
-          skipped++;
+          inserted++;
+        }
+
+        if (saved.isFinished && saved.actualScore) {
+          settled++;
         }
       } catch (error) {
         skipped++;
 
-        console.error(
-          `[FOOTBALL] Failed to save fixture ${match.id}:`,
+        console.warn(
+          `[FOOTBALL] Could not process fixture ${match.id}:`,
           error.message
         );
       }
     }
 
-    const resultSummary = {
+    // Preserve older predictions and their history.
+    const upcoming = await Prediction.find({
       sport: 'football',
-      fetched: matches.length,
+      isFinished: false,
+      date: { $gte: new Date() }
+    })
+      .sort({ date: 1 })
+      .limit(FOOTBALL_LIMIT)
+      .select('_id')
+      .lean();
+
+    const keepIds = upcoming.map(item => item._id);
+
+    const telegram = await sendTelegramPredictions();
+
+    lastCycle = {
+      at: new Date().toISOString(),
+      provider: 'Football-Data.org',
+      sportmonksFixtures: smFixtures.length,
+      fetched: fixtures.length,
       eligible: eligible.length,
       inserted,
       updated,
-      skipped
+      skipped,
+      settled,
+      upcomingWithinLimit: keepIds.length,
+      telegram,
+      durationMs: Date.now() - started
     };
 
+    lastCycleError = null;
+
     console.log(
-      '[CYCLE] Football results:',
-      JSON.stringify(resultSummary)
+      `[CYCLE] Football results: ${JSON.stringify(lastCycle)}`
     );
 
-    if (matches.length === 0) {
-      console.warn(
-        '[FOOTBALL] No fixtures were returned. Check your API token, ' +
-        'date range, and free-plan competition coverage.'
-      );
-    } else if (eligible.length === 0) {
-      console.warn(
-        '[FOOTBALL] Fixtures were returned, but none qualified as ' +
-        'upcoming scheduled matches in the selected date range.'
-      );
-    }
-
-    await sendTelegramPredictions();
+    return lastCycle;
   } catch (error) {
+    lastCycleError = {
+      at: new Date().toISOString(),
+      message: error.message,
+      status: error.response?.status || null
+    };
+
     console.error(
-      '[FOOTBALL] Fetch failed:',
+      '[CYCLE] Failed:',
       error.response?.status || '',
-      JSON.stringify(
-        error.response?.data || error.message
-      )
-    );
-  } finally {
-    console.log(
-      `[CYCLE] Finished in ${
-        ((Date.now() - startedAt) / 1000).toFixed(1)
-      } seconds.`
+      error.message
     );
 
-    cycleRunning = false;
+    throw error;
+  } finally {
+    refreshInProgress = false;
   }
 }
 
-// ==================================================
-// 8. RETENTION
-// Preserve old records and prediction history.
-// ==================================================
+// ============================================================
+// ADMIN AUTHENTICATION
+// ============================================================
 
-async function cleanupOldMatches() {
-  console.log(
-    '[CLEANUP] Automatic deletion disabled to preserve history.'
-  );
+function requireAdmin(req, res, next) {
+  if (!ADMIN_API_KEY) {
+    return res.status(503).json({
+      ok: false,
+      error: 'Admin endpoint is not configured'
+    });
+  }
+
+  const supplied =
+    req.get('x-admin-key') ||
+    req.get('authorization')?.replace(/^Bearer\s+/i, '');
+
+  const suppliedBuffer = Buffer.from(String(supplied || ''));
+  const expectedBuffer = Buffer.from(String(ADMIN_API_KEY));
+
+  if (
+    !supplied ||
+    suppliedBuffer.length !== expectedBuffer.length ||
+    !crypto.timingSafeEqual(suppliedBuffer, expectedBuffer)
+  ) {
+    return res.status(401).json({
+      ok: false,
+      error: 'Unauthorized'
+    });
+  }
+
+  next();
 }
 
-// ==================================================
-// 9. HEALTH CHECK
-// ==================================================
+// ============================================================
+// API ROUTES
+// ============================================================
 
-app.get('/health', (req, res) => {
+app.get('/', (_req, res) => {
+  res.json({
+    ok: true,
+    name: 'Match Intelligence AI',
+    sport: 'football',
+    status: 'running'
+  });
+});
+
+app.get('/health', async (_req, res) => {
   res.json({
     ok: true,
     db: mongoose.connection.readyState === 1,
     sport: 'football',
     provider: 'Football-Data.org',
+    sportmonksConfigured: Boolean(SPORTMONKS_API_TOKEN),
+    refreshInProgress,
+    lastCycle,
+    lastCycleError,
     timestamp: new Date().toISOString()
   });
 });
 
-// ==================================================
-// 10. PREDICTIONS API — FOOTBALL ONLY
-// ==================================================
-app.get('/api/sportmonks/health', async (req, res) => {
+app.get('/api/health', async (_req, res) => {
+  const [predictionCount, historyCount] = await Promise.all([
+    Prediction.countDocuments({ sport: 'football' }).catch(() => 0),
+    History.countDocuments({ sport: 'football' }).catch(() => 0)
+  ]);
+
+  res.json({
+    ok: true,
+    stage: 'football-fixtures',
+    provider: 'Football-Data.org',
+    apiKeyConfigured: Boolean(FOOTBALL_DATA_API_KEY),
+    sportmonksConfigured: Boolean(SPORTMONKS_API_TOKEN),
+    refreshInProgress,
+    predictionCount,
+    historyCount,
+    lastCycle,
+    lastCycleError,
+    checkedAt: new Date().toISOString()
+  });
+});
+
+app.get('/api/sportmonks/health', async (_req, res) => {
   if (!SPORTMONKS_API_TOKEN) {
-    return res.status(503).json({
+    return res.status(200).json({
       ok: false,
-      error: 'SPORTMONKS_API_TOKEN is missing.'
+      provider: 'Sportmonks',
+      authenticated: false,
+      error: 'SPORTMONKS_API_TOKEN is not configured'
     });
   }
 
   try {
-    const response = await axios.get(
-      'https://api.sportmonks.com/v3/football/fixtures',
-      {
-        headers: {
-          Authorization: SPORTMONKS_API_TOKEN
-        },
-        params: {
-          per_page: 1
-        },
-        timeout: REQUEST_TIMEOUT_MS
+    const response = await sportmonksApi.get('/fixtures', {
+      params: {
+        per_page: 1
       }
-    );
+    });
 
     res.json({
       ok: true,
@@ -670,331 +1223,254 @@ app.get('/api/sportmonks/health', async (req, res) => {
         : 0
     });
   } catch (error) {
-    console.error(
-      '[SPORTMONKS] Connection test failed:',
-      error.response?.status || '',
-      JSON.stringify(error.response?.data || error.message)
-    );
-
     res.status(502).json({
       ok: false,
       provider: 'Sportmonks',
-      error: 'Connection test failed. Check Render logs.'
+      authenticated: false,
+      status: error.response?.status || null,
+      error: error.response?.data?.message || error.message
     });
   }
 });
+
 app.get('/api/predictions', async (req, res) => {
   try {
-    const filter = {
+    const limit = clamp(
+      parseInt(req.query.limit, 10) || 100,
+      1,
+      300
+    );
+
+    const query = {
       sport: 'football'
     };
 
-    if (req.query.from || req.query.to) {
-      filter.date = {};
-
-      if (
-        req.query.from &&
-        isValidDate(req.query.from)
-      ) {
-        filter.date.$gte = new Date(req.query.from);
-      }
-
-      if (
-        req.query.to &&
-        isValidDate(req.query.to)
-      ) {
-        const end = new Date(req.query.to);
-        end.setUTCHours(23, 59, 59, 999);
-        filter.date.$lte = end;
-      }
+    if (req.query.status === 'upcoming') {
+      query.isFinished = false;
+      query.date = { $gte: new Date() };
     }
 
-    const predictions = await Prediction.find(filter)
+    if (req.query.status === 'finished') {
+      query.isFinished = true;
+    }
+
+    const predictions = await Prediction.find(query)
       .sort({ date: 1 })
+      .limit(limit)
       .lean();
 
     res.json({
+      ok: true,
+      count: predictions.length,
       predictions,
-      counts: {
-        football: predictions.length,
-        basketball: 0
-      }
+      data: predictions
     });
   } catch (error) {
-    console.error(
-      '[API] Predictions error:',
-      error.message
-    );
-
     res.status(500).json({
-      error: 'Failed to load football predictions.'
+      ok: false,
+      error: 'Could not load predictions'
     });
   }
 });
-
-// ==================================================
-// 11. PREDICTION HISTORY
-// ==================================================
 
 app.get('/api/history', async (req, res) => {
   try {
+    const limit = clamp(
+      parseInt(req.query.limit, 10) || 100,
+      1,
+      300
+    );
+
     const history = await History.find({
       sport: 'football'
     })
-      .sort({ _id: -1 })
-      .limit(100)
+      .sort({ settledAt: -1 })
+      .limit(limit)
       .lean();
 
-    const correct = history.filter(
-      item => item.isCorrect === true
-    ).length;
-
-    const decided = history.filter(
-      item =>
-        item.isCorrect === true ||
-        item.isCorrect === false
-    ).length;
-
     res.json({
+      ok: true,
+      count: history.length,
       history,
-      sampleSize: decided,
-      accuracy: decided
-        ? (correct / decided * 100).toFixed(1)
-        : 0
+      data: history
     });
   } catch (error) {
-    console.error(
-      '[API] History error:',
-      error.message
-    );
-
     res.status(500).json({
-      error: 'Failed to load football history.'
+      ok: false,
+      error: 'Could not load history'
     });
   }
 });
 
-// ==================================================
-// 12. ANALYTICS
-// ==================================================
-
-app.get('/api/analytics', async (req, res) => {
+app.get('/api/analytics', async (_req, res) => {
   try {
-    const history = await History.find({
-      sport: 'football',
-      isCorrect: { $in: [true, false] }
-    }).lean();
+    const [
+      total,
+      finished,
+      historyCount,
+      correct,
+      avgConfidence
+    ] = await Promise.all([
+      Prediction.countDocuments({
+        sport: 'football'
+      }),
 
-    const correct = history.filter(
-      item => item.isCorrect === true
-    ).length;
+      Prediction.countDocuments({
+        sport: 'football',
+        isFinished: true
+      }),
+
+      History.countDocuments({
+        sport: 'football'
+      }),
+
+      History.countDocuments({
+        sport: 'football',
+        isCorrect: true
+      }),
+
+      Prediction.aggregate([
+        {
+          $match: {
+            sport: 'football',
+            confidenceScore: { $type: 'number' }
+          }
+        },
+        {
+          $group: {
+            _id: null,
+            average: { $avg: '$confidenceScore' }
+          }
+        }
+      ])
+    ]);
 
     res.json({
-      sampleSize: history.length,
-      accuracy: history.length
-        ? (correct / history.length * 100).toFixed(1)
-        : 0,
-      brierScore: null,
-      note:
-        'Accuracy is based only on recorded, evaluated football ' +
-        'outcomes. Brier score is unavailable until outcome ' +
-        'probabilities are recorded and evaluated.'
+      ok: true,
+      sport: 'football',
+      totalPredictions: total,
+      finishedPredictions: finished,
+      historyCount,
+      correctPredictions: correct,
+
+      accuracy: historyCount
+        ? Math.round(correct / historyCount * 1000) / 10
+        : null,
+
+      averageConfidence: avgConfidence[0]?.average == null
+        ? null
+        : Math.round(avgConfidence[0].average * 10) / 10
     });
   } catch (error) {
-    console.error(
-      '[API] Analytics error:',
-      error.message
-    );
-
     res.status(500).json({
-      error: 'Failed to load football analytics.'
+      ok: false,
+      error: 'Could not calculate analytics'
     });
   }
 });
-
-// ==================================================
-// 13. ADMIN AUTHENTICATION
-// ==================================================
-
-function adminAuth(req, res, next) {
-  const key = process.env.ADMIN_API_KEY;
-
-  if (!key || req.headers['x-admin-key'] !== key) {
-    return res.status(401).json({
-      error: 'Unauthorized'
-    });
-  }
-
-  next();
-}
 
 app.post(
   '/api/admin/run-cycle',
-  adminAuth,
-  async (req, res) => {
-    if (cycleRunning) {
-      return res.status(409).json({
-        error: 'A football fixture cycle is already running.'
+  requireAdmin,
+  async (_req, res) => {
+    try {
+      const result = await runDailyCycle();
+
+      res.json({
+        ok: true,
+        result
+      });
+    } catch (error) {
+      res.status(502).json({
+        ok: false,
+        error: 'Cycle failed',
+        detail: error.response?.status || error.message
       });
     }
-
-    // Run asynchronously so the request can return immediately.
-    runDailyCycle().catch(error => {
-      console.error(
-        '[ADMIN] Cycle failed:',
-        error.message
-      );
-    });
-
-    res.status(202).json({
-      message:
-        'Football fixture cycle started. Check Render logs for results.'
-    });
   }
 );
 
-// ==================================================
-// 14. TELEGRAM NOTIFICATIONS — FOOTBALL ONLY
-// ==================================================
+app.get(
+  '/api/admin/run-cycle',
+  requireAdmin,
+  async (_req, res) => {
+    try {
+      const result = await runDailyCycle();
 
-async function sendTelegramPredictions() {
-  const botToken = process.env.TELEGRAM_BOT_TOKEN;
-  const chatId =
-    process.env.TELEGRAM_CHAT_ID ||
-    '@MatchIntelligenceAI';
-
-  if (!botToken) {
-    return;
-  }
-
-  try {
-    const picks = await Prediction.find({
-      sport: 'football',
-      status: 'Scheduled',
-      date: { $gte: new Date() }
-    })
-      .sort({ date: 1 })
-      .limit(3)
-      .lean();
-
-    if (!picks.length) {
-      console.log(
-        '[TELEGRAM] No upcoming football predictions to send.'
-      );
-      return;
+      res.json({
+        ok: true,
+        result
+      });
+    } catch (error) {
+      res.status(502).json({
+        ok: false,
+        error: 'Cycle failed',
+        detail: error.response?.status || error.message
+      });
     }
-
-    let message =
-      '⚽ *MATCH INTELLIGENCE AI - FOOTBALL ESTIMATES* ⚽\n\n';
-
-    for (let i = 0; i < picks.length; i++) {
-      const prediction = picks[i];
-
-      message +=
-        `*${i + 1}. ${prediction.homeTeam} vs ${prediction.awayTeam}*\n`;
-
-      message += `League: ${prediction.league}\n`;
-
-      message +=
-        `Kickoff: ${new Date(prediction.date).toUTCString()}\n`;
-
-      message +=
-        `Baseline selection: ${prediction.predictedWinner}\n`;
-
-      message +=
-        `Model quality: ${prediction.dataQuality}\n\n`;
-    }
-
-    message +=
-      '⚠️ Baseline estimates only, not guarantees. Bet responsibly.';
-
-    await axios.post(
-      `https://api.telegram.org/bot${botToken}/sendMessage`,
-      {
-        chat_id: chatId,
-        text: message,
-        parse_mode: 'Markdown'
-      },
-      {
-        timeout: REQUEST_TIMEOUT_MS
-      }
-    );
-
-    console.log(
-      '[TELEGRAM] Football predictions sent.'
-    );
-  } catch (error) {
-    console.error(
-      '[TELEGRAM] Send failed:',
-      JSON.stringify(
-        error.response?.data || error.message
-      )
-    );
   }
-}
+);
 
-// ==================================================
-// 15. START SERVER
-// ==================================================
+// ============================================================
+// ERROR HANDLER
+// ============================================================
+
+app.use((error, _req, res, _next) => {
+  console.error('[HTTP] Unhandled error:', error.message);
+
+  res.status(500).json({
+    ok: false,
+    error: 'Internal server error'
+  });
+});
+
+// ============================================================
+// START SERVER
+// ============================================================
 
 async function startServer() {
   if (!MONGO_URI) {
-    console.error(
-      '[STARTUP] MONGO_URI is missing. Configure it in Render.'
-    );
-    process.exit(1);
+    throw new Error('MONGO_URI is required');
   }
 
-  if (!FOOTBALL_DATA_API_KEY) {
-    console.error(
-      '[STARTUP] FOOTBALL_DATA_API_KEY is missing. ' +
-      'Add it to Render Environment variables.'
+  await mongoose.connect(MONGO_URI, {
+    serverSelectionTimeoutMS: 15000
+  });
+
+  console.log('[DATABASE] MongoDB connected.');
+
+  app.listen(PORT, () => {
+    console.log(
+      `Match Intelligence AI listening on port ${PORT}.`
     );
-  }
 
-  try {
-    await mongoose.connect(MONGO_URI);
-
-    console.log('[DATABASE] MongoDB connected.');
-
-    app.listen(PORT, () => {
-      console.log(
-        `Match Intelligence AI listening on port ${PORT}.`
-      );
-      console.log('[STARTUP] Active sport: football only.');
-      console.log('[STARTUP] Provider: Football-Data.org.');
-    });
-
-    // Run one cycle after startup.
-    if (FOOTBALL_DATA_API_KEY) {
-      runDailyCycle().catch(error => {
-        console.error(
-          '[STARTUP] Initial cycle failed:',
-          error.message
-        );
-      });
-    }
-
-    // Repeat every six hours.
-    cron.schedule('0 */6 * * *', () => {
-      runDailyCycle().catch(error => {
-        console.error(
-          '[CRON] Football cycle failed:',
-          error.message
-        );
-      });
-    });
+    console.log('[STARTUP] Active sport: football only.');
 
     console.log(
-      '[CRON] Football fixture cycle scheduled every six hours.'
+      '[STARTUP] Provider: Football-Data.org; Sportmonks enrichment: ' +
+      (SPORTMONKS_API_TOKEN ? 'configured' : 'not configured')
     );
-  } catch (error) {
+  });
+
+  runDailyCycle().catch(error => {
     console.error(
-      '[STARTUP] Failed to connect to MongoDB:',
+      '[STARTUP] Initial cycle failed:',
       error.message
     );
-    process.exit(1);
-  }
+  });
+
+  cron.schedule('0 */6 * * *', () => {
+    runDailyCycle().catch(error => {
+      console.error('[CRON] Cycle failed:', error.message);
+    });
+  });
+
+  console.log(
+    '[CRON] Football fixture cycle scheduled every six hours.'
+  );
 }
 
-startServer();
+startServer().catch(error => {
+  console.error('[STARTUP] Fatal error:', error.message);
+  process.exit(1);
+});
