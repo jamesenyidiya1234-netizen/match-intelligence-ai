@@ -19,6 +19,8 @@ app.use(express.json({ limit: '1mb' }));
 const PORT = process.env.PORT || 5001;
 const MONGO_URI = process.env.MONGO_URI;
 const FOOTBALL_DATA_API_KEY = process.env.FOOTBALL_DATA_API_KEY;
+const FOOTBALL_DATA_API_KEY = process.env.FOOTBALL_DATA_API_KEY;
+const SPORTMONKS_API_TOKEN = process.env.SPORTMONKS_API_TOKEN;
 
 const FOOTBALL_LIMIT = Math.max(
   1,
@@ -638,7 +640,50 @@ app.get('/health', (req, res) => {
 // ==================================================
 // 10. PREDICTIONS API — FOOTBALL ONLY
 // ==================================================
+app.get('/api/sportmonks/health', async (req, res) => {
+  if (!SPORTMONKS_API_TOKEN) {
+    return res.status(503).json({
+      ok: false,
+      error: 'SPORTMONKS_API_TOKEN is missing.'
+    });
+  }
 
+  try {
+    const response = await axios.get(
+      'https://api.sportmonks.com/v3/football/fixtures',
+      {
+        headers: {
+          Authorization: SPORTMONKS_API_TOKEN
+        },
+        params: {
+          per_page: 1
+        },
+        timeout: REQUEST_TIMEOUT_MS
+      }
+    );
+
+    res.json({
+      ok: true,
+      provider: 'Sportmonks',
+      authenticated: true,
+      fixturesReturned: Array.isArray(response.data?.data)
+        ? response.data.data.length
+        : 0
+    });
+  } catch (error) {
+    console.error(
+      '[SPORTMONKS] Connection test failed:',
+      error.response?.status || '',
+      JSON.stringify(error.response?.data || error.message)
+    );
+
+    res.status(502).json({
+      ok: false,
+      provider: 'Sportmonks',
+      error: 'Connection test failed. Check Render logs.'
+    });
+  }
+});
 app.get('/api/predictions', async (req, res) => {
   try {
     const filter = {
