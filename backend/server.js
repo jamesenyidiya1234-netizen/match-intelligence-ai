@@ -612,59 +612,16 @@ async function getRecentFormFromFootballData(
   from,
   to
 ) {
-  if (!FOOTBALL_DATA_API_KEY || !teamId) {
-    return null;
-  }
-
   const cacheKey = `${teamId}:${from}:${to}`;
   const cached = recentFormCache.get(cacheKey);
 
-  if (
-    cached &&
-    Date.now() - cached.at < 6 * 60 * 60 * 1000
-  ) {
+  if (cached) {
     return cached.value;
   }
 
-  try {
-    const response = await footballApi.get(
-      `/teams/${teamId}/matches`,
-      {
-        params: {
-          dateFrom: from,
-          dateTo: to,
-          status: 'FINISHED',
-          limit: 10
-        }
-      }
-    );
-
-    const matches = (response.data?.matches || []).map(item => ({
-      homeTeamId: item.homeTeam?.id,
-      awayTeamId: item.awayTeam?.id,
-      homeGoals: item.score?.fullTime?.home,
-      awayGoals: item.score?.fullTime?.away
-    }));
-
-    const value = teamScoreFromRecentMatches(
-      teamId,
-      matches
-    );
-
-    recentFormCache.set(cacheKey, {
-      value,
-      at: Date.now()
-    });
-
-    return value;
-  } catch (error) {
-    console.warn(
-      `[FORM] Could not load recent form for team ${teamId}:`,
-      error.response?.status || error.message
-    );
-
-    return null;
-  }
+  // No individual team request here.
+  // Recent form must be populated from a bulk results request.
+  return null;
 }
 
 // ============================================================
