@@ -19,7 +19,6 @@ app.use(express.json({ limit: '1mb' }));
 const PORT = process.env.PORT || 5001;
 const MONGO_URI = process.env.MONGO_URI;
 const FOOTBALL_DATA_API_KEY = process.env.FOOTBALL_DATA_API_KEY;
-const FOOTBALL_DATA_API_KEY = process.env.FOOTBALL_DATA_API_KEY;
 const SPORTMONKS_API_TOKEN = process.env.SPORTMONKS_API_TOKEN;
 
 const FOOTBALL_LIMIT = Math.max(
