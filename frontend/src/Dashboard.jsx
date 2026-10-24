@@ -288,11 +288,15 @@ function normalizePredictions(responseData) {
     );
   }
 
+  const now = Date.now();
+
   return list.filter(
     (item) =>
       item &&
       typeof item === 'object' &&
       isValidDate(item.date) &&
+      new Date(item.date).getTime() >= now &&
+      item.isFinished !== true &&
       String(item.sport || 'football').toLowerCase() !== ''
   );
 }
@@ -321,7 +325,7 @@ export default function Dashboard({
 
     try {
       const response = await axios.get(
-        `${API_BASE_URL}/api/predictions`,
+        `${API_BASE_URL}/api/predictions?status=upcoming&limit=300`,
         {
           timeout: 20000,
           headers: { Accept: 'application/json' },
