@@ -91,6 +91,11 @@ const predictionSchema = new mongoose.Schema({
     default: false,
     index: true
   },
+  telegramSentAt: {
+    type: Date,
+    default: null,
+    index: true
+  },
 
   isCorrect: Boolean,
   allMarkets: mongoose.Schema.Types.Mixed,
@@ -844,27 +849,25 @@ async function settlePrediction(prediction) {
 
 async function sendTelegramPredictions() {
   if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
-    return {
-      sent: false,
-      reason: 'Telegram not configured'
-    };
+    return { sent: false, reason: 'Telegram not configured' };
   }
 
   try {
     const upcoming = await Prediction.find({
       sport: 'football',
       isFinished: false,
-      date: { $gte: new Date() }
+      date: { $gte: new Date() },
+      $or: [
+        { telegramSentAt: { $exists: false } },
+        { telegramSentAt: null }
+      ]
     })
       .sort({ confidenceScore: -1, date: 1 })
       .limit(3)
       .lean();
 
     if (!upcoming.length) {
-      return {
-        sent: false,
-        reason: 'No upcoming predictions'
-      };
+      return { sent: false, reason: 'No new upcoming predictions to publish' };
     }
 
     const lines = [
@@ -873,29 +876,13 @@ async function sendTelegramPredictions() {
     ];
 
     for (const item of upcoming) {
-      lines.push(
-        `${item.homeTeam} vs ${item.awayTeam}`
-      );
-
-      lines.push(
-        `Pick: ${item.predictedWinner} (${item.confidenceScore ?? 'N/A'}%)`
-      );
-
-      lines.push(
-        `Score estimate: ${item.predictedScore || 'N/A'} | Quality: ${item.dataQuality || 'Unknown'}`
-      );
-
-      lines.push(
-        item.date
-          ? new Date(item.date).toUTCString()
-          : 'Kickoff TBC',
-        ''
-      );
+      lines.push(`${item.homeTeam} vs ${item.awayTeam}`);
+      lines.push(`Pick: ${item.predictedWinner || 'No pick'} (${item.confidenceScore ?? 'N/A'}%)`);
+      lines.push(`Score estimate: ${item.predictedScore || 'N/A'} | Quality: ${item.dataQuality || 'Unknown'}`);
+      lines.push(item.date ? new Date(item.date).toUTCString() : 'Kickoff TBC', '');
     }
 
-    lines.push(
-      'Probabilities are estimates, not guarantees. Verify team news before acting.'
-    );
+    lines.push('Probabilities are estimates, not guarantees. Verify team news before acting.');
 
     await axios.post(
       `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
@@ -904,34 +891,21 @@ async function sendTelegramPredictions() {
         text: lines.join('\n'),
         disable_web_page_preview: true
       },
-      {
-        timeout: REQUEST_TIMEOUT_MS
-      }
+      { timeout: REQUEST_TIMEOUT_MS }
     );
 
-    console.log('[TELEGRAM] Football predictions sent.');
+    await Prediction.updateMany(
+      { _id: { $in: upcoming.map(item => item._id) } },
+      { $set: { telegramSentAt: new Date() } }
+    );
 
-    return {
-      sent: true,
-      count: upcoming.length
-    };
+    console.log(`[TELEGRAM] Published ${upcoming.length} new football predictions.`);
+    return { sent: true, count: upcoming.length };
   } catch (error) {
-    console.warn(
-      '[TELEGRAM] Send failed:',
-      error.response?.status || error.message
-    );
-
-    return {
-      sent: false,
-      reason: 'Telegram send failed'
-    };
+    console.warn('[TELEGRAM] Send failed:', error.response?.status || error.message);
+    return { sent: false, reason: 'Telegram send failed' };
   }
 }
-
-// ============================================================
-// AUTOMATIC FOOTBALL DATA REFRESH
-// ============================================================
-
 async function runDailyCycle() {
   if (refreshInProgress) {
     return {
