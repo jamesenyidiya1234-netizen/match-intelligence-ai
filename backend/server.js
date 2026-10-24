@@ -172,6 +172,9 @@ let lastProviderStatus = {
 
 const recentFormCache = new Map();
 
+let recentFormCacheLoadedFor = null;
+let recentFormCacheLoadedAt = 0;
+
 // ============================================================
 // GENERAL HELPERS
 // ============================================================
@@ -420,16 +423,32 @@ function getScoreFromSportmonks(fixture) {
 // PREDICTION ENGINE
 // ============================================================
 
+
 function analyzeFootball(match, recentForm = {}) {
   const homeForm = recentForm.home || null;
   const awayForm = recentForm.away || null;
 
-  // General starting estimates; these are not live team statistics.
+  // Use recent form only when both teams have at least five
+  // completed matches and the required statistics are valid.
+  const hasUsableForm = (form) =>
+    Boolean(
+      form &&
+      Number(form.played) >= 5 &&
+      Number.isFinite(Number(form.pointsPerGame)) &&
+      Number.isFinite(Number(form.goalsFor)) &&
+      Number.isFinite(Number(form.goalsAgainst))
+    );
+
+  const formAvailable =
+    hasUsableForm(homeForm) &&
+    hasUsableForm(awayForm);
+
+  // General starting estimates. These are not live team statistics.
   let homeLambda = 1.42;
   let awayLambda = 1.12;
 
-  // Adjust estimates modestly when both teams have recent-form data.
-  if (homeForm && awayForm) {
+  // Adjust estimates only when both teams have five-match form.
+  if (formAvailable) {
     const homeAttack = clamp(
       homeForm.goalsFor / 1.35,
       0.55,
@@ -461,19 +480,19 @@ function analyzeFootball(match, recentForm = {}) {
       0.65 * awayAttack + 0.35 * homeDefence;
 
     homeLambda *= clamp(
-      1 + (
-        homeForm.pointsPerGame -
-        awayForm.pointsPerGame
-      ) * 0.035,
+      1 +
+        (homeForm.pointsPerGame -
+          awayForm.pointsPerGame) *
+          0.035,
       0.88,
       1.12
     );
 
     awayLambda *= clamp(
-      1 + (
-        awayForm.pointsPerGame -
-        homeForm.pointsPerGame
-      ) * 0.035,
+      1 +
+        (awayForm.pointsPerGame -
+          homeForm.pointsPerGame) *
+          0.035,
       0.88,
       1.12
     );
@@ -548,16 +567,13 @@ function analyzeFootball(match, recentForm = {}) {
     choices[0].probability * 100
   );
 
-  const formAvailable = Boolean(homeForm && awayForm);
-
   const topScores = grid
     .sort((a, b) => b.probability - a.probability)
     .slice(0, 5)
-    .map(item => ({
+    .map((item) => ({
       score: item.score,
-      probability: Math.round(
-        item.probability * 1000
-      ) / 10
+      probability:
+        Math.round(item.probability * 1000) / 10
     }));
 
   const markets = {
@@ -595,39 +611,215 @@ function analyzeFootball(match, recentForm = {}) {
     predictedScore: topScores[0]?.score || '1-1',
 
     dataQuality: formAvailable
-      ? 'MEDIUM - RECENT FORM AVAILABLE'
-      : 'LOW - FORM DATA UNAVAILABLE',
+      ? 'MEDIUM - LAST FIVE MATCHES AVAILABLE'
+      : 'LOW - LAST FIVE MATCHES INCOMPLETE',
 
     recommendation: confidenceScore >= 58
       ? 'Consider only after reviewing team news and odds.'
       : 'No strong winner edge; consider avoiding this market.',
 
     aiExplanation: formAvailable
-      ? 'Poisson-based estimate using modest recent-form adjustments and a home advantage prior. It does not include verified injuries, confirmed lineups, bookmaker odds, or xG unless separately available.'
-      : 'Baseline Poisson estimate using general home advantage. Verified recent team form was unavailable, so confidence should be treated cautiously. This is not a guarantee.'
+      ? 'Poisson-based estimate using both teams’ recent-form statistics from at least five completed matches and a home-advantage starting estimate. Verified injuries, suspensions, confirmed lineups, bookmaker odds, and xG are not included unless separately available.'
+      : 'Baseline Poisson estimate using a general home-advantage starting estimate. At least one team lacks usable statistics from five completed matches, so recent-form adjustments were not applied. Verified injuries, suspensions, confirmed lineups, bookmaker odds, and xG are not included unless separately available. Predictions are estimates, not guarantees.'
   };
 }
+
 
 // ============================================================
 // LOAD RECENT MATCHES FOR EACH TEAM
 // ============================================================
+
+async function refreshRecentFormCache(from, to) {
+  const rangeKey = `${from}:${to}`;
+
+  const cacheIsFresh =
+    recentFormCacheLoadedFor === rangeKey &&
+    Date.now() - recentFormCacheLoadedAt <
+      20 * 60 * 60 * 1000;
+
+  if (cacheIsFresh) {
+    return true;
+  }
+
+  try {
+    console.log(
+      `[FORM] Loading completed matches from ${from} to ${to} in seven-day windows.`
+    );
+
+    const allMatches = [];
+    let cursor = from;
+
+    while (cursor < to) {
+      const windowEnd = formatDateUTC(
+        addDays(new Date(`${cursor}T00:00:00Z`), 7)
+      );
+
+      const chunkEnd = windowEnd < to ? windowEnd : to;
+
+      if (chunkEnd <= cursor) {
+        throw new Error(
+          `Invalid date window: ${cursor} to ${chunkEnd}`
+        );
+      }
+
+      console.log(
+        `[FORM] Requesting results from ${cursor} to ${chunkEnd}.`
+      );
+
+      const matches = await fetchFootballFixtures(
+        cursor,
+        chunkEnd
+      );
+
+      if (!Array.isArray(matches)) {
+        throw new Error(
+          `Invalid fixture response for ${cursor} to ${chunkEnd}`
+        );
+      }
+
+      allMatches.push(...matches);
+      cursor = chunkEnd;
+    }
+
+    const uniqueMatches = new Map();
+
+    for (const match of allMatches) {
+      if (match?.id != null) {
+        uniqueMatches.set(String(match.id), match);
+      }
+    }
+
+    const teamMatches = new Map();
+    let validFinishedMatchCount = 0;
+
+    for (const match of uniqueMatches.values()) {
+      if (match.status !== 'FINISHED') continue;
+
+      const homeId = match.homeTeam?.id;
+      const awayId = match.awayTeam?.id;
+      const homeGoals = match.score?.fullTime?.home;
+      const awayGoals = match.score?.fullTime?.away;
+      const matchTime = Date.parse(match.utcDate);
+
+      if (
+        homeId == null ||
+        awayId == null ||
+        homeGoals == null ||
+        awayGoals == null ||
+        !Number.isFinite(Number(homeGoals)) ||
+        !Number.isFinite(Number(awayGoals)) ||
+        !Number.isFinite(matchTime)
+      ) {
+        continue;
+      }
+
+      const result = {
+        homeTeamId: String(homeId),
+        awayTeamId: String(awayId),
+        homeGoals: Number(homeGoals),
+        awayGoals: Number(awayGoals),
+        utcDate: match.utcDate
+      };
+
+      validFinishedMatchCount++;
+
+      for (const teamId of [
+        String(homeId),
+        String(awayId)
+      ]) {
+        if (!teamMatches.has(teamId)) {
+          teamMatches.set(teamId, []);
+        }
+
+        teamMatches.get(teamId).push(result);
+      }
+    }
+
+    if (validFinishedMatchCount === 0) {
+      throw new Error(
+        'No valid completed matches were returned; existing cache was preserved'
+      );
+    }
+
+    // Build the replacement separately. Do not alter the active cache
+    // until the new data has passed validation.
+    const nextCache = new Map();
+    let teamsWithFiveMatches = 0;
+
+    for (const [teamId, results] of teamMatches.entries()) {
+      const lastFive = results
+        .sort(
+          (a, b) =>
+            Date.parse(b.utcDate) - Date.parse(a.utcDate)
+        )
+        .slice(0, 5);
+
+      const form = teamScoreFromRecentMatches(
+        teamId,
+        lastFive
+      );
+
+      if (form) {
+        nextCache.set(
+          `${teamId}:${from}:${to}`,
+          { value: form }
+        );
+
+        if (form.played >= 5) {
+          teamsWithFiveMatches++;
+        }
+      }
+    }
+
+    if (nextCache.size === 0) {
+      throw new Error(
+        'No team-form records could be calculated; existing cache was preserved'
+      );
+    }
+
+    // Commit only after the refresh and calculations have succeeded.
+    recentFormCache.clear();
+
+    for (const [key, value] of nextCache.entries()) {
+      recentFormCache.set(key, value);
+    }
+
+    recentFormCacheLoadedFor = rangeKey;
+    recentFormCacheLoadedAt = Date.now();
+
+    console.log(
+      `[FORM] Successfully processed ${validFinishedMatchCount} unique completed matches.`
+    );
+    console.log(
+      `[FORM] Found results for ${teamMatches.size} teams; ${teamsWithFiveMatches} teams have five completed matches.`
+    );
+
+    return true;
+  } catch (error) {
+    console.warn(
+      '[FORM] Recent results unavailable; refresh was not marked successful:',
+      error.response?.status || error.message
+    );
+
+    return false;
+  }
+}
 
 async function getRecentFormFromFootballData(
   teamId,
   from,
   to
 ) {
+  if (teamId == null) {
+    return null;
+  }
+
   const cacheKey = `${teamId}:${from}:${to}`;
   const cached = recentFormCache.get(cacheKey);
 
-  if (cached) {
-    return cached.value;
-  }
-
-  // No individual team request here.
-  // Recent form must be populated from a bulk results request.
-  return null;
+  return cached ? cached.value : null;
 }
+
 
 // ============================================================
 // SAVE AND UPDATE FIXTURE PREDICTIONS
@@ -937,6 +1129,21 @@ async function runDailyCycle() {
       fetchSportmonksFixtures(from, to)
     ]);
 
+    const recentStart = formatDateUTC(
+      addDays(new Date(), -60)
+    );
+
+    const recentEnd = formatDateUTC(new Date());
+
+    const recentFormRefreshSucceeded =
+      await refreshRecentFormCache(recentStart, recentEnd);
+
+    if (!recentFormRefreshSucceeded) {
+      console.warn(
+        '[CYCLE] Recent-form refresh failed. Predictions will use the model fallback where form is unavailable.'
+      );
+    }
+
     const smMap = mapSportmonksFixtures(smFixtures);
 
     const eligible = fixtures
@@ -1012,6 +1219,7 @@ async function runDailyCycle() {
       sportmonksFixtures: smFixtures.length,
       fetched: fixtures.length,
       eligible: eligible.length,
+      recentFormRefreshSucceeded,
       inserted,
       updated,
       skipped,
@@ -1021,7 +1229,13 @@ async function runDailyCycle() {
       durationMs: Date.now() - started
     };
 
-    lastCycleError = null;
+    lastCycleError = recentFormRefreshSucceeded
+      ? null
+      : {
+          at: new Date().toISOString(),
+          message: 'Recent-form refresh failed; baseline predictions may be used where team form is unavailable.',
+          status: null
+        };
 
     console.log(
       `[CYCLE] Football results: ${JSON.stringify(lastCycle)}`
