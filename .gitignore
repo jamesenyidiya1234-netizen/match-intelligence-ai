@@ -1,0 +1,18 @@
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+
+# Dependencies
+node_modules/
+
+# Local data and backups
+data/
+*.backup.js
+*.before-*.js
+*.zip
+
+# macOS files
+.DS_Store
+# Temporary server backups
+backend/server.js.before-*
